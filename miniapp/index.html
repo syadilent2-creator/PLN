@@ -65,8 +65,13 @@
     display:none;flex-direction:column;
   }
   #cameraModal.active{display:flex;}
+  #cameraModal{align-items:center;justify-content:center;}
+  #cameraStage{
+    position:relative;width:100%;height:100%;max-width:520px;
+    margin:0 auto;overflow:hidden;background:#000;
+  }
   #video, #resultCanvas{
-    width:100%;flex:1;object-fit:cover;background:#000;
+    position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000;
   }
   #resultCanvas{display:none;}
   .cam-controls{
@@ -107,23 +112,28 @@
 <body>
 
 <header>
-  <img src="pln-logo.png" alt="PLN" onerror="this.style.display='none'">
+  <svg width="28" height="28" viewBox="0 0 40 40" aria-hidden="true">
+    <circle cx="20" cy="20" r="19" fill="#F7B600" stroke="#fff" stroke-width="1.5"/>
+    <path d="M22 6 L11 22 H18 L16 34 L29 16 H21 Z" fill="#0A3D8F"/>
+  </svg>
   <h1>Dokumentasi Kegiatan PLN</h1>
 </header>
 
 <div class="grid" id="menuGrid"></div>
 
 <div id="cameraModal">
-  <button id="closeCam">&times;</button>
-  <span id="statusText">Mengambil lokasi...</span>
-  <video id="video" autoplay playsinline muted></video>
-  <canvas id="resultCanvas"></canvas>
-  <div class="cam-controls" id="camControls">
-    <button id="shutterBtn"></button>
-  </div>
-  <div class="result-controls" id="resultControls">
-    <button id="retakeBtn">Ambil Ulang</button>
-    <button id="saveBtn">Gunakan Foto</button>
+  <div id="cameraStage">
+    <button id="closeCam">&times;</button>
+    <span id="statusText">Mengambil lokasi...</span>
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="resultCanvas"></canvas>
+    <div class="cam-controls" id="camControls">
+      <button id="shutterBtn"></button>
+    </div>
+    <div class="result-controls" id="resultControls">
+      <button id="retakeBtn">Ambil Ulang</button>
+      <button id="saveBtn">Gunakan Foto</button>
+    </div>
   </div>
 </div>
 
@@ -134,7 +144,7 @@ Telegram.WebApp.ready();
 Telegram.WebApp.expand();
 
 // ==== KONFIGURASI ====
-const SERVER_URL = "https://pln-production-fd9d.up.railway.app/upload"; // ganti dengan URL backend kamu
+const SERVER_URL = "https://server-kamu.com/upload"; // ganti dengan URL backend kamu
 const KEGIATAN_LIST = [
   { id: "inspeksi", label: "Inspeksi", icon: "\u{1F50D}" },
   { id: "gangguan", label: "Gangguan", icon: "\u26A0\uFE0F" },
@@ -160,7 +170,11 @@ KEGIATAN_LIST.forEach(k => {
 let currentKegiatan = "";
 let currentStream = null;
 let capturedBlob = null;
-let currentLoc = { lat: null, lon: null, namaDaerah: "Mencari lokasi..." };
+let currentLoc = {
+  lat: null, lon: null,
+  jalan: "", kelurahan: "", kecamatan: "", kota: "",
+  status: "Mencari lokasi..."
+};
 
 const modal = document.getElementById("cameraModal");
 const video = document.getElementById("video");
@@ -191,7 +205,12 @@ async function openCamera(label) {
 
   try {
     currentStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 1920 } },
+      video: {
+        facingMode: "environment",
+        width: { ideal: 1080 },
+        height: { ideal: 1920 },
+        aspectRatio: { ideal: 9 / 16 }
+      },
       audio: false
     });
     video.srcObject = currentStream;
@@ -206,7 +225,7 @@ async function openCamera(label) {
 
 function getLocation() {
   if (!navigator.geolocation) {
-    currentLoc.namaDaerah = "Lokasi tidak tersedia";
+    currentLoc.status = "Lokasi tidak tersedia";
     return;
   }
   navigator.geolocation.getCurrentPosition(async (pos) => {
@@ -214,17 +233,20 @@ function getLocation() {
     currentLoc.lon = pos.coords.longitude;
     try {
       const res = await fetch(
-        `https://nominatim.openstreetmap.org/reverse?lat=${currentLoc.lat}&lon=${currentLoc.lon}&format=json&accept-language=id`
+        `https://nominatim.openstreetmap.org/reverse?lat=${currentLoc.lat}&lon=${currentLoc.lon}&format=json&accept-language=id&zoom=18`
       );
       const data = await res.json();
       const a = data.address || {};
-      currentLoc.namaDaerah = [a.village || a.suburb, a.city || a.county, a.state]
-        .filter(Boolean).join(", ") || data.display_name || "Lokasi tidak diketahui";
+      currentLoc.jalan = a.road || a.pedestrian || a.residential || "";
+      currentLoc.kelurahan = a.village || a.suburb || a.hamlet || a.neighbourhood || "";
+      currentLoc.kecamatan = a.city_district || a.subdistrict || a.municipality || "";
+      currentLoc.kota = a.city || a.town || a.county || a.regency || "";
+      currentLoc.status = "ok";
     } catch {
-      currentLoc.namaDaerah = "Lokasi tidak diketahui";
+      currentLoc.status = "Lokasi tidak diketahui";
     }
   }, () => {
-    currentLoc.namaDaerah = "Izin lokasi ditolak";
+    currentLoc.status = "Izin lokasi ditolak";
   }, { enableHighAccuracy: true, timeout: 10000 });
 }
 
@@ -234,11 +256,31 @@ function closeCamera() {
 }
 
 function takePhoto() {
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const targetRatio = 9 / 16; // potret
+
+  // Hitung area crop tengah supaya hasil akhir selalu 9:16,
+  // apapun rasio asli kamera (laptop/webcam sering landscape).
+  let cropW, cropH, sx, sy;
+  if (vw / vh > targetRatio) {
+    cropH = vh;
+    cropW = vh * targetRatio;
+  } else {
+    cropW = vw;
+    cropH = vw / targetRatio;
+  }
+  sx = (vw - cropW) / 2;
+  sy = (vh - cropH) / 2;
+
+  const outW = 1080;
+  const outH = Math.round(outW / targetRatio);
+  canvas.width = outW;
+  canvas.height = outH;
+
   const ctx = canvas.getContext("2d");
-  ctx.drawImage(video, 0, 0);
-  drawWatermark(ctx, canvas.width, canvas.height);
+  ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, outW, outH);
+  drawWatermark(ctx, outW, outH);
 
   video.style.display = "none";
   canvas.style.display = "block";
@@ -248,31 +290,82 @@ function takePhoto() {
   if (currentStream) currentStream.getTracks().forEach(t => t.stop());
 }
 
+function drawPlnLogo(ctx, cx, cy, r) {
+  // Lingkaran kuning
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = "#F7B600";
+  ctx.fill();
+  ctx.lineWidth = r * 0.08;
+  ctx.strokeStyle = "#fff";
+  ctx.stroke();
+
+  // Petir biru di tengah (path disesuaikan skala r)
+  ctx.save();
+  ctx.translate(cx - r * 0.55, cy - r * 0.75);
+  const s = r / 20;
+  ctx.beginPath();
+  ctx.moveTo(22 * s, 6 * s);
+  ctx.lineTo(11 * s, 22 * s);
+  ctx.lineTo(18 * s, 22 * s);
+  ctx.lineTo(16 * s, 34 * s);
+  ctx.lineTo(29 * s, 16 * s);
+  ctx.lineTo(21 * s, 16 * s);
+  ctx.closePath();
+  ctx.fillStyle = "#0A3D8F";
+  ctx.fill();
+  ctx.restore();
+}
+
 function drawWatermark(ctx, w, h) {
   const now = new Date();
   const tanggal = now.toLocaleDateString("id-ID", { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
   const jam = now.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" }) + " WIB";
   const koordinat = currentLoc.lat
-    ? `${currentLoc.lat.toFixed(4)}, ${currentLoc.lon.toFixed(4)}`
+    ? `${currentLoc.lat.toFixed(6)}, ${currentLoc.lon.toFixed(6)}`
     : "Koordinat tidak tersedia";
 
-  const boxH = Math.round(h * 0.16);
+  const baris2 = [currentLoc.jalan, currentLoc.kelurahan].filter(Boolean).join(", ") ||
+    (currentLoc.status !== "ok" ? currentLoc.status : "Alamat tidak ditemukan");
+  const baris3 = [
+    currentLoc.kecamatan ? `Kec. ${currentLoc.kecamatan}` : "",
+    currentLoc.kota
+  ].filter(Boolean).join(", ");
+
+  // Skala font berdasarkan dimensi TERKECIL, supaya tidak raksasa
+  // meski kamera memberi frame landscape (mis. webcam laptop).
+  const base = Math.min(w, h);
+  const fontBase = Math.round(base * 0.026);
+  const pad = base * 0.035;
+  const lineGap = fontBase * 1.35;
+
+  const lines = [koordinat, baris3, baris2, `${tanggal} \u00B7 ${jam}`].filter(Boolean);
+  const logoR = fontBase * 1.1;
+  const boxH = pad * 1.6 + logoR * 2 + lines.length * lineGap + pad * 0.3;
   const boxY = h - boxH;
-  ctx.fillStyle = "rgba(0,0,0,0.55)";
+
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
   ctx.fillRect(0, boxY, w, boxH);
 
-  const pad = w * 0.04;
-  const fontBase = Math.round(w * 0.032);
-  ctx.textBaseline = "top";
+  // Logo
+  const logoCx = pad + logoR;
+  const logoCy = boxY + pad + logoR;
+  drawPlnLogo(ctx, logoCx, logoCy, logoR);
+
+  // Judul di samping logo
+  ctx.textBaseline = "middle";
   ctx.fillStyle = "#fff";
-
   ctx.font = `700 ${fontBase}px sans-serif`;
-  ctx.fillText("PT PLN (PERSERO)", pad, boxY + pad * 0.6);
+  ctx.fillText("PT PLN (PERSERO)", logoCx + logoR + pad * 0.6, logoCy);
 
-  ctx.font = `400 ${fontBase * 0.85}px sans-serif`;
-  ctx.fillText(`${tanggal} \u00B7 ${jam}`, pad, boxY + pad * 0.6 + fontBase * 1.3);
-  ctx.fillText(currentLoc.namaDaerah, pad, boxY + pad * 0.6 + fontBase * 2.5, w - pad * 2);
-  ctx.fillText(koordinat, pad, boxY + pad * 0.6 + fontBase * 3.7);
+  // Baris info di bawah logo
+  ctx.textBaseline = "top";
+  ctx.font = `400 ${Math.round(fontBase * 0.9)}px sans-serif`;
+  let y = boxY + pad + logoR * 2 + pad * 0.4;
+  lines.forEach(line => {
+    ctx.fillText(line, pad, y, w - pad * 2);
+    y += lineGap;
+  });
 }
 
 function retake() {
@@ -299,6 +392,10 @@ async function uploadToServer(blob) {
   formData.append("user_id", user.id || "");
   formData.append("lat", currentLoc.lat || "");
   formData.append("lon", currentLoc.lon || "");
+  formData.append("jalan", currentLoc.jalan || "");
+  formData.append("kelurahan", currentLoc.kelurahan || "");
+  formData.append("kecamatan", currentLoc.kecamatan || "");
+  formData.append("kota", currentLoc.kota || "");
 
   try {
     const res = await fetch(SERVER_URL, { method: "POST", body: formData });
