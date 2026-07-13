@@ -50,6 +50,10 @@ def upload():
         user_id = request.form.get("user_id")
         lat = request.form.get("lat", "-")
         lon = request.form.get("lon", "-")
+        jalan = request.form.get("jalan", "")
+        kelurahan = request.form.get("kelurahan", "")
+        kecamatan = request.form.get("kecamatan", "")
+        kota = request.form.get("kota", "")
         photo = request.files.get("photo")
 
         if not photo:
@@ -70,11 +74,15 @@ def upload():
 
         # 2. Kirim balik foto ke chat Telegram user
         label = KEGIATAN_LABEL.get(kegiatan, kegiatan)
-        caption = (
-            f"{label}\n"
-            f"{now.strftime('%d %b %Y, %H:%M')} WIB\n"
-            f"Koordinat: {lat}, {lon}"
-        )
+        alamat = ", ".join(filter(None, [jalan, kelurahan]))
+        wilayah = ", ".join(filter(None, [f"Kec. {kecamatan}" if kecamatan else "", kota]))
+        caption_lines = [label, f"{now.strftime('%d %b %Y, %H:%M')} WIB"]
+        if alamat:
+            caption_lines.append(alamat)
+        if wilayah:
+            caption_lines.append(wilayah)
+        caption_lines.append(f"Koordinat: {lat}, {lon}")
+        caption = "\n".join(caption_lines)
         kirim_foto_ke_telegram(user_id, filepath, caption)
 
         return jsonify({"status": "ok", "path": filepath})
