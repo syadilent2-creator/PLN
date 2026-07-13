@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Dokumentasi Kegiatan PLN</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root{
+    --pln-yellow:#F7B600;
+    --pln-blue:#0A3D8F;
+    --bg:#F4F5F7;
+    --card:#FFFFFF;
+    --text:#1C1C1E;
+    --muted:#6B7280;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    padding-bottom:24px;
+  }
+  header{
+    background:var(--pln-blue);
+    color:#fff;
+    padding:16px;
+    display:flex;
+    align-items:center;
+    gap:10px;
+  }
+  header img{width:28px;height:28px;}
+  header h1{font-size:16px;font-weight:600;}
+  .grid{
+    display:grid;
+    grid-template-columns:1fr 1fr 1fr;
+    gap:12px;
+    padding:16px;
+  }
+  .card{
+    background:var(--card);
+    border-radius:14px;
+    padding:12px 8px;
+    text-align:center;
+    box-shadow:0 1px 3px rgba(0,0,0,0.08);
+  }
+  .card .icon{font-size:28px;margin-bottom:6px;}
+  .card .label{font-size:12px;font-weight:600;margin-bottom:8px;min-height:32px;display:flex;align-items:center;justify-content:center;}
+  .btn-add{
+    background:var(--pln-yellow);
+    color:#1C1C1E;
+    border:none;
+    border-radius:10px;
+    padding:8px 0;
+    width:100%;
+    font-weight:700;
+    font-size:12px;
+    letter-spacing:.3px;
+  }
+  .btn-add:active{opacity:.8;}
+
+  /* Modal kamera */
+  #cameraModal{
+    position:fixed;inset:0;background:#000;z-index:999;
+    display:none;flex-direction:column;
+  }
+  #cameraModal.active{display:flex;}
+  #video, #resultCanvas{
+    width:100%;flex:1;object-fit:cover;background:#000;
+  }
+  #resultCanvas{display:none;}
+  .cam-controls{
+    position:absolute;bottom:24px;left:0;right:0;
+    display:flex;justify-content:center;align-items:center;gap:32px;
+  }
+  .cam-controls.hidden{display:none;}
+  #shutterBtn{
+    width:68px;height:68px;border-radius:50%;
+    background:#fff;border:4px solid rgba(255,255,255,.4);
+  }
+  .result-controls{
+    position:absolute;bottom:24px;left:0;right:0;
+    display:none;justify-content:center;gap:16px;padding:0 16px;
+  }
+  .result-controls.active{display:flex;}
+  .result-controls button{
+    flex:1;padding:12px;border-radius:10px;border:none;font-weight:700;font-size:14px;
+  }
+  #retakeBtn{background:#444;color:#fff;}
+  #saveBtn{background:var(--pln-yellow);color:#1C1C1E;}
+  #closeCam{
+    position:absolute;top:16px;right:16px;z-index:10;
+    background:rgba(0,0,0,.5);color:#fff;border:none;
+    width:36px;height:36px;border-radius:50%;font-size:18px;
+  }
+  #statusText{
+    position:absolute;top:16px;left:16px;color:#fff;font-size:12px;
+    background:rgba(0,0,0,.5);padding:6px 10px;border-radius:8px;
+  }
+  .toast{
+    position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+    background:#1C1C1E;color:#fff;padding:10px 18px;border-radius:10px;
+    font-size:13px;z-index:1200;display:none;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <img src="pln-logo.png" alt="PLN" onerror="this.style.display='none'">
+  <h1>Dokumentasi Kegiatan PLN</h1>
+</header>
+
+<div class="grid" id="menuGrid"></div>
+
+<div id="cameraModal">
+  <button id="closeCam">&times;</button>
+  <span id="statusText">Mengambil lokasi...</span>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="resultCanvas"></canvas>
+  <div class="cam-controls" id="camControls">
+    <button id="shutterBtn"></button>
+  </div>
+  <div class="result-controls" id="resultControls">
+    <button id="retakeBtn">Ambil Ulang</button>
+    <button id="saveBtn">Gunakan Foto</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+Telegram.WebApp.ready();
+Telegram.WebApp.expand();
+
+// ==== KONFIGURASI ====
+const SERVER_URL = "https://server-kamu.com/upload"; // ganti dengan URL backend kamu
+const KEGIATAN_LIST = [
+  { id: "inspeksi", label: "Inspeksi", icon: "\u{1F50D}" },
+  { id: "gangguan", label: "Gangguan", icon: "\u26A0\uFE0F" },
+  { id: "pemeliharaan", label: "Pemeliharaan Gardu", icon: "\u{1F527}" },
+  { id: "row", label: "ROW", icon: "\u{1F333}" },
+  { id: "pemutusan", label: "Pemutusan", icon: "\u2702\uFE0F" },
+  { id: "inspeksi_tiang", label: "Inspeksi Tiang", icon: "\u{1F5FC}" },
+  { id: "temuan", label: "Temuan", icon: "\u{1F4CB}" }
+];
+
+const grid = document.getElementById("menuGrid");
+KEGIATAN_LIST.forEach(k => {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <div class="icon">${k.icon}</div>
+    <div class="label">${k.label}</div>
+    <button class="btn-add" data-kegiatan="${k.id}" data-label="${k.label}">AMBIL FOTO</button>
+  `;
+  grid.appendChild(card);
+});
+
+let currentKegiatan = "";
+let currentStream = null;
+let capturedBlob = null;
+let currentLoc = { lat: null, lon: null, namaDaerah: "Mencari lokasi..." };
+
+const modal = document.getElementById("cameraModal");
+const video = document.getElementById("video");
+const canvas = document.getElementById("resultCanvas");
+const statusText = document.getElementById("statusText");
+const camControls = document.getElementById("camControls");
+const resultControls = document.getElementById("resultControls");
+
+document.addEventListener("click", (e) => {
+  if (e.target.classList.contains("btn-add")) {
+    currentKegiatan = e.target.dataset.kegiatan;
+    openCamera(e.target.dataset.label);
+  }
+});
+
+document.getElementById("closeCam").onclick = closeCamera;
+document.getElementById("shutterBtn").onclick = takePhoto;
+document.getElementById("retakeBtn").onclick = retake;
+document.getElementById("saveBtn").onclick = saveAndSend;
+
+async function openCamera(label) {
+  modal.classList.add("active");
+  statusText.textContent = "Kegiatan: " + label;
+  video.style.display = "block";
+  canvas.style.display = "none";
+  camControls.classList.remove("hidden");
+  resultControls.classList.remove("active");
+
+  try {
+    currentStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 1920 } },
+      audio: false
+    });
+    video.srcObject = currentStream;
+  } catch (err) {
+    showToast("Gagal akses kamera: " + err.message);
+    closeCamera();
+    return;
+  }
+
+  getLocation();
+}
+
+function getLocation() {
+  if (!navigator.geolocation) {
+    currentLoc.namaDaerah = "Lokasi tidak tersedia";
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(async (pos) => {
+    currentLoc.lat = pos.coords.latitude;
+    currentLoc.lon = pos.coords.longitude;
+    try {
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?lat=${currentLoc.lat}&lon=${currentLoc.lon}&format=json&accept-language=id`
+      );
+      const data = await res.json();
+      const a = data.address || {};
+      currentLoc.namaDaerah = [a.village || a.suburb, a.city || a.county, a.state]
+        .filter(Boolean).join(", ") || data.display_name || "Lokasi tidak diketahui";
+    } catch {
+      currentLoc.namaDaerah = "Lokasi tidak diketahui";
+    }
+  }, () => {
+    currentLoc.namaDaerah = "Izin lokasi ditolak";
+  }, { enableHighAccuracy: true, timeout: 10000 });
+}
+
+function closeCamera() {
+  if (currentStream) currentStream.getTracks().forEach(t => t.stop());
+  modal.classList.remove("active");
+}
+
+function takePhoto() {
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(video, 0, 0);
+  drawWatermark(ctx, canvas.width, canvas.height);
+
+  video.style.display = "none";
+  canvas.style.display = "block";
+  camControls.classList.add("hidden");
+  resultControls.classList.add("active");
+
+  if (currentStream) currentStream.getTracks().forEach(t => t.stop());
+}
+
+function drawWatermark(ctx, w, h) {
+  const now = new Date();
+  const tanggal = now.toLocaleDateString("id-ID", { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
+  const jam = now.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" }) + " WIB";
+  const koordinat = currentLoc.lat
+    ? `${currentLoc.lat.toFixed(4)}, ${currentLoc.lon.toFixed(4)}`
+    : "Koordinat tidak tersedia";
+
+  const boxH = Math.round(h * 0.16);
+  const boxY = h - boxH;
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillRect(0, boxY, w, boxH);
+
+  const pad = w * 0.04;
+  const fontBase = Math.round(w * 0.032);
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#fff";
+
+  ctx.font = `700 ${fontBase}px sans-serif`;
+  ctx.fillText("PT PLN (PERSERO)", pad, boxY + pad * 0.6);
+
+  ctx.font = `400 ${fontBase * 0.85}px sans-serif`;
+  ctx.fillText(`${tanggal} \u00B7 ${jam}`, pad, boxY + pad * 0.6 + fontBase * 1.3);
+  ctx.fillText(currentLoc.namaDaerah, pad, boxY + pad * 0.6 + fontBase * 2.5, w - pad * 2);
+  ctx.fillText(koordinat, pad, boxY + pad * 0.6 + fontBase * 3.7);
+}
+
+function retake() {
+  canvas.style.display = "none";
+  video.style.display = "block";
+  camControls.classList.remove("hidden");
+  resultControls.classList.remove("active");
+  openCamera(currentKegiatan);
+}
+
+function saveAndSend() {
+  canvas.toBlob(async (blob) => {
+    capturedBlob = blob;
+    await uploadToServer(blob);
+  }, "image/jpeg", 0.92);
+}
+
+async function uploadToServer(blob) {
+  showToast("Mengirim foto...");
+  const user = Telegram.WebApp.initDataUnsafe.user || {};
+  const formData = new FormData();
+  formData.append("photo", blob, "foto.jpg");
+  formData.append("kegiatan", currentKegiatan);
+  formData.append("user_id", user.id || "");
+  formData.append("lat", currentLoc.lat || "");
+  formData.append("lon", currentLoc.lon || "");
+
+  try {
+    const res = await fetch(SERVER_URL, { method: "POST", body: formData });
+    if (!res.ok) throw new Error("Server error " + res.status);
+    showToast("Foto tersimpan & dikirim ke chat");
+    setTimeout(closeCamera, 1200);
+  } catch (err) {
+    showToast("Gagal upload: " + err.message);
+  }
+}
+
+function showToast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.style.display = "block";
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.style.display = "none"; }, 2500);
+}
+</script>
+</body>
+</html>
