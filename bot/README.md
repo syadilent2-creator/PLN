@@ -57,19 +57,27 @@ Sekarang tombol menu (ikon di sebelah kolom chat, seperti "View Menu" di gambar 
 ### 5. Uji coba
 Buka bot di Telegram → tekan tombol menu → izinkan akses kamera & lokasi → ambil foto kegiatan → cek folder `foto/{kegiatan}/{tanggal}/` di server, dan cek chat Telegram menerima foto baliknya.
 
-## Fitur baru: Lokasi otomatis & Foto via reply
+## Fitur baru: Lokasi otomatis, Foto via reply, & tombol keyboard
 
 Sheet punya 9 kolom: `No, Hari, Tanggal, Kegiatan, Deskripsi, Material, Jumlah, Lokasi, Gambar`.
 
 1. **Kegiatan** — teks laporan (VN atau ketik) dicocokkan otomatis oleh AI ke salah satu dari 5 kategori resmi (EMERGENCY, INSPEKSI GARDU, PEMELIHARAAN, ROW, INSPEKSI JTM) berdasarkan konteks, bukan cuma kata pertama.
 2. **Material & Jumlah** — dikenali dari kata kunci seperti "mengganti", "menggunakan", "sebanyak", "jumlah", atau pola "nama barang + angka + satuan".
-3. **Lokasi** — otomatis terisi dari lokasi terakhir yang di-share user (tombol 📍 Bagikan Lokasi, atau dari Mini App kamera), berupa `nama daerah (lat, lon)`.
-4. **Gambar** — setelah bot membalas ringkasan laporan, **reply pesan ringkasan itu dengan foto**. Foto akan diupload ke Google Drive (pakai service account yang sama) lalu disisipkan ke kolom Gambar di baris yang sama memakai formula `=IMAGE(url, 1)`, sehingga foto otomatis menyesuaikan ukuran cell. Kalau user kirim foto tanpa reply spesifik, foto tetap masuk ke baris laporan terakhir user tsb.
+3. **Lokasi** — otomatis terisi dari lokasi terakhir yang di-share user (tombol 📍, atau dari Mini App kamera), berupa `nama daerah (lat, lon)`.
+4. **Gambar** — setelah bot membalas ringkasan laporan, **reply pesan ringkasan itu dengan foto**. Foto disimpan di server bot ini sendiri (folder `foto/sheet_gambar/`) dan di-serve lewat endpoint publik `/foto/...`, lalu disisipkan ke kolom Gambar di baris yang sama memakai formula `=IMAGE(url, 1)` — otomatis menyesuaikan ukuran cell.
+5. **Tombol keyboard persisten** — setelah `/start`, muncul 2 tombol di bawah kolom chat:
+   - 📍 **Bagikan Lokasi Saya** — 1 tap langsung share lokasi (tanpa buka menu attachment).
+   - 🔄 **Mulai Kegiatan Baru** — reset kaitan "laporan terakhir" supaya foto berikutnya tidak salah nyangkut ke laporan lama, lalu bot siap terima laporan baru.
 
-### Setup tambahan untuk fitur foto
-1. Di Google Cloud Console (project yang sama dengan service account), **aktifkan Google Drive API** (selain Sheets API yang sudah aktif).
-2. Service account otomatis bisa upload ke foldernya sendiri. Kalau mau foto masuk ke folder Drive tertentu (misal folder yang sudah kamu share ke tim), buat folder di Drive, share ke email service account (role Editor), lalu isi env var `DRIVE_FOLDER_ID` dengan ID folder tsb.
-3. Tidak perlu ubah izin sheet — service account yang sudah edit access ke spreadsheet otomatis bisa menulis formula gambar.
+### Kenapa foto TIDAK diupload ke Google Drive?
+Sempat dicoba pakai Google Drive, tapi service account **tidak punya storage quota sendiri** di Drive biasa (khusus akun Gmail non-Workspace, upload akan selalu gagal dengan error `storageQuotaExceeded`). Solusi resminya butuh Shared Drive (fitur Google Workspace) atau OAuth delegation — keduanya ribet buat setup kecil begini. Jadi foto di-host sendiri oleh backend ini (pola yang sama seperti fitur foto Mini App yang sudah ada sejak awal).
+
+### Setup wajib untuk fitur foto: `PUBLIC_BASE_URL`
+1. Buka project Railway kamu → tab **Settings** → cari domain publiknya (biasanya `https://nama-app-xxxx.up.railway.app`, atau domain custom kalau sudah di-set).
+2. Tambahkan environment variable baru: `PUBLIC_BASE_URL` = domain tsb (tanpa slash `/` di akhir).
+3. Redeploy.
+
+**Catatan penting soal penyimpanan:** foto disimpan di disk container Railway. Kalau Railway kamu pakai **ephemeral filesystem** (default, tanpa Volume), foto bisa hilang saat redeploy/restart. Untuk penyimpanan permanen, tambahkan **Railway Volume** dan mount ke folder kerja bot (misal `/app/foto`) lewat tab **Volumes** di project Railway.
 
 ## Yang perlu disesuaikan lagi
 - **Reverse geocoding**: contoh pakai Nominatim (gratis, ada rate limit). Untuk pemakaian production/banyak user, ganti ke Google Maps Geocoding API (berbayar tapi lebih stabil & akurat).
