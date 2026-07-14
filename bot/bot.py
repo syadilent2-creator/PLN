@@ -250,7 +250,7 @@ def proses_voice_note(user_id, chat_id, file_id):
             }]
         }
 
-        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
         res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
@@ -340,11 +340,25 @@ Aturan Ekstraksi Laporan:
    - PEMELIHARAAN
    - ROW
    - INSPEKSI JTM
-   Pilih yang paling mendekati dan sesuai dari kelima opsi tersebut (contoh: jika tentang cek gardu atau inspeksi gardu, pilih "INSPEKSI GARDU"; jika tentang pemeliharaan, ganti alat, perbaikan, pilih "PEMELIHARAAN").
+   Pilih yang paling sesuai.
 
-2. Kalimat atau bagian kedua menjelaskan "deskripsi" detail dari kegiatan tersebut (misal: "cek kondisi trafo aman", "pembersihan ranting pohon").
+2. Kalimat atau bagian kedua menjelaskan "deskripsi" detail dari kegiatan tersebut. Ambil HANYA bagian kedua ini sebagai deskripsi (jangan masukkan kalimat pertama atau ketiga).
 
-3. Kalimat atau bagian ketiga menjelaskan "material" yang digunakan beserta "jumlah" nya (misal: "ganti isolator 3 buah" -> nama material: "isolator", jumlah: "3 buah").
+3. Kalimat atau bagian ketiga menjelaskan "material" yang digunakan beserta "jumlah" nya. Pisahkan dengan jelas antara nama material dan jumlahnya.
+
+Contoh Ekstraksi:
+Teks: "Inspeksi gardu, cek kondisi trafo aman, ganti isolator 3 buah"
+Output JSON:
+{{
+  "kegiatan": "INSPEKSI GARDU",
+  "deskripsi": "cek kondisi trafo aman",
+  "material": [
+    {{
+      "nama": "isolator",
+      "jumlah": "3 buah"
+    }}
+  ]
+}}
 
 Teks Laporan: \"\"\"{teks}\"\"\"
 
@@ -375,7 +389,7 @@ Jika tidak ada material yang digunakan, isi "material": []."""
     }
 
     try:
-        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
         res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
