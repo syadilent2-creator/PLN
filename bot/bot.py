@@ -55,13 +55,11 @@ app = Flask(__name__)
 LAST_LOCATION = {}
 
 KEGIATAN_LABEL = {
-    "inspeksi": "Inspeksi",
-    "gangguan": "Gangguan",
-    "pemeliharaan": "Pemeliharaan Gardu",
+    "emergency": "EMERGENCY",
+    "inspeksi_gardu": "INSPEKSI GARDU",
+    "pemeliharaan": "PEMELIHARAAN",
     "row": "ROW",
-    "pemutusan": "Pemutusan",
-    "inspeksi_tiang": "Inspeksi Tiang",
-    "temuan": "Temuan",
+    "inspeksi_jtm": "INSPEKSI JTM",
 }
 
 
@@ -252,7 +250,7 @@ def proses_voice_note(user_id, chat_id, file_id):
             }]
         }
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
         res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
@@ -336,17 +334,23 @@ def ekstrak_laporan(teks: str) -> dict:
     prompt = f"""Kamu adalah asisten pencatatan laporan lapangan PLN. Tugasmu adalah mengekstrak teks laporan menjadi format JSON terstruktur.
 
 Aturan Ekstraksi Laporan:
-1. Kalimat atau bagian pertama dari teks menjelaskan "kegiatan" (misal: "Inspeksi gardu", "Pemeliharaan gardu", "ROW", dll).
-2. Kalimat atau bagian kedua menjelaskan "deskripsi" detail dari kegiatan tersebut (misal: "cek kondisi trafo aman", "pembersihan ranting pohon").
-3. Kalimat atau bagian ketiga menjelaskan "material" yang digunakan beserta "jumlah" nya (misal: "ganti isolator 3 buah" -> nama material: "isolator", jumlah: "3 buah").
+1. Kalimat atau bagian pertama dari teks menjelaskan "kegiatan". Kamu WAJIB mencocokkan dan memilih salah satu dari kategori resmi berikut (tulis persis sama):
+   - EMERGENCY
+   - INSPEKSI GARDU
+   - PEMELIHARAAN
+   - ROW
+   - INSPEKSI JTM
+   Pilih yang paling mendekati dan sesuai dari kelima opsi tersebut (contoh: jika tentang cek gardu atau inspeksi gardu, pilih "INSPEKSI GARDU"; jika tentang pemeliharaan, ganti alat, perbaikan, pilih "PEMELIHARAAN").
 
-Kategori kegiatan resmi yang umum: {kategori}. Jika kegiatan tidak cocok dengan kategori resmi, gunakan nama kegiatan singkat dari kalimat pertama.
+2. Kalimat atau bagian kedua menjelaskan "deskripsi" detail dari kegiatan tersebut (misal: "cek kondisi trafo aman", "pembersihan ranting pohon").
+
+3. Kalimat atau bagian ketiga menjelaskan "material" yang digunakan beserta "jumlah" nya (misal: "ganti isolator 3 buah" -> nama material: "isolator", jumlah: "3 buah").
 
 Teks Laporan: \"\"\"{teks}\"\"\"
 
 Balas HANYA dengan JSON valid tanpa formatting markdown seperti ```json atau penjelas lainnya. Format JSON harus persis seperti ini:
 {{
-  "kegiatan": "kegiatan dari kalimat/bagian pertama",
+  "kegiatan": "PILIH SALAH SATU: EMERGENCY / INSPEKSI GARDU / PEMELIHARAAN / ROW / INSPEKSI JTM",
   "deskripsi": "deskripsi kegiatan dari kalimat/bagian kedua",
   "material": [
     {{
@@ -371,7 +375,7 @@ Jika tidak ada material yang digunakan, isi "material": []."""
     }
 
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
         res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
