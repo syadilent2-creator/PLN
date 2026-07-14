@@ -29,13 +29,11 @@ from typing import Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from dotenv import load_dotenv
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
@@ -48,15 +46,15 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1vXFzN8nktmBmHUzN9KqkpaIBhHUSmoaXCXQOMb2Q2MY")
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # isi mentah file JSON service account
-# Folder Google Drive (opsional) tempat menyimpan foto yang di-upload lewat reply chat.
-# Kalau kosong, file diupload ke root "My Drive" milik service account.
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")
 
-# Scope gabungan: Sheets (baca/tulis) + Drive (upload file, hanya file yang dibuat sendiri oleh bot)
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
-]
+# URL publik backend ini sendiri (Railway/dst), dipakai supaya Google Sheets bisa
+# mengambil foto yang di-reply user lewat formula IMAGE(). WAJIB diisi untuk fitur
+# foto -> kolom Gambar. Railway biasanya kasih domain seperti https://xxxx.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+# Scope Sheets biasa saja (fitur foto sekarang di-host sendiri, bukan lewat Google Drive,
+# jadi tidak butuh scope Drive / kena masalah "service account tidak punya storage quota")
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 TZ = ZoneInfo("Asia/Jakarta")
 HARI_ID = ["SENIN", "SELASA", "RABU", "KAMIS", "JUM'AT", "SABTU", "MINGGU"]
@@ -90,6 +88,22 @@ KEGIATAN_LABEL = {
     "row": "ROW",
     "inspeksi_jtm": "INSPEKSI JTM",
 }
+
+# --- Label tombol keyboard persisten (share lokasi + mulai kegiatan baru) ---
+TOMBOL_LOKASI = "\U0001F4CD Bagikan Lokasi Saya"
+TOMBOL_MULAI_ULANG = "\U0001F504 Mulai Kegiatan Baru"
+
+
+def main_keyboard() -> dict:
+    """Keyboard persisten (selalu tampil di chat) berisi tombol share-lokasi 1-tap
+    dan tombol untuk mulai mencatat kegiatan baru kapan saja."""
+    return {
+        "keyboard": [
+            [{"text": TOMBOL_LOKASI, "request_location": True}],
+            [{"text": TOMBOL_MULAI_ULANG}],
+        ],
+        "resize_keyboard": True,
+    }
 
 
 # ======================================================================
@@ -317,6 +331,18 @@ def telegram_webhook():
     # --- Teks biasa (bukan command): anggap laporan yang diketik manual ---
     if "text" in msg:
         teks = msg["text"].strip()
+
+        # Tombol "Mulai Kegiatan Baru" (dikirim sebagai teks biasa oleh keyboard Telegram)
+        if teks == TOMBOL_MULAI_ULANG:
+            LAST_ROW_BY_USER.pop(user_id, None)
+            kirim_pesan(
+                chat_id,
+                "Oke, siap menerima laporan kegiatan baru \u2705\n\n"
+                "Kirim *pesan suara* atau *ketik teks* laporannya sekarang.",
+                reply_markup=main_keyboard(),
+            )
+            return jsonify({"ok": True})
+
         if teks.startswith("/"):
             if teks == "/start":
                 kirim_pesan(
@@ -324,8 +350,11 @@ def telegram_webhook():
                     "Halo! Kirim *pesan suara* ATAU *ketik teks* untuk mencatat laporan kegiatan.\n\n"
                     "Contoh ketik: \"Inspeksi gardu, cek kondisi trafo aman, "
                     "ganti isolator 3 buah\"\n\n"
-                    "Sebelum mulai (sekali per shift), share lokasi kamu lewat "
-                    "\U0001F4CE > Location, supaya laporan mencantumkan lokasi kerja."
+                    "Sebelum mulai (sekali per shift), tap tombol \U0001F4CD di bawah untuk "
+                    "membagikan lokasi kerja kamu, supaya laporan otomatis mencantumkan lokasi.\n\n"
+                    "Kalau mau memulai catatan kegiatan yang baru kapan saja, tap tombol "
+                    "\U0001F504 Mulai Kegiatan Baru.",
+                    reply_markup=main_keyboard(),
                 )
             return jsonify({"ok": True})
 
@@ -361,7 +390,7 @@ def proses_location(user_id, chat_id, loc):
     kirim_pesan(
         chat_id,
         f"Lokasi tersimpan: {nama}\nAkan dipakai otomatis untuk laporan-laporan berikutnya.",
-        reply_markup={"remove_keyboard": True},
+        reply_markup=main_keyboard(),
     )
 
 
@@ -497,42 +526,38 @@ def download_telegram_file(file_id: str, suffix: str = ".oga") -> str:
 
 
 # ======================================================================
-# 3. [BARU] FOTO SEBAGAI REPLY -> UPLOAD KE DRIVE -> TAMPIL DI KOLOM GAMBAR
+# 3. [BARU] FOTO SEBAGAI REPLY -> HOST SENDIRI DI BACKEND -> KOLOM GAMBAR
 # ======================================================================
+# Kenapa tidak upload ke Google Drive? Karena Drive milik service account TIDAK
+# punya storage quota sendiri (khusus akun Gmail biasa/non-Workspace, ini akan
+# selalu gagal dengan error "storageQuotaExceeded"). Solusinya: foto disimpan di
+# disk server ini sendiri (folder foto/sheet_gambar/) lalu di-serve lewat endpoint
+# publik /foto/<path>, dan URL itu yang dipakai formula IMAGE() di Google Sheets.
 
-def get_drive_service():
-    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=GOOGLE_SCOPES)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+FOTO_SHEET_DIR = os.path.join(BASE_FOTO_DIR, "sheet_gambar")
 
 
-def upload_foto_ke_drive(local_path: str, nama_file: str) -> str:
-    """Upload file lokal ke Google Drive (pakai service account yang sama dengan Sheets),
-    jadikan link-nya bisa diakses publik (anyone-with-link, read only), lalu kembalikan
-    URL gambar langsung yang bisa dibaca oleh formula IMAGE() di Google Sheets."""
-    service = get_drive_service()
-
-    metadata = {"name": nama_file}
-    if DRIVE_FOLDER_ID:
-        metadata["parents"] = [DRIVE_FOLDER_ID]
-
-    media = MediaFileUpload(local_path, mimetype="image/jpeg", resumable=False)
-    file = service.files().create(body=metadata, media_body=media, fields="id").execute()
-    file_id = file["id"]
-
-    # Buka akses baca untuk siapa saja yang punya link (supaya Google Sheets bisa fetch gambarnya)
-    service.permissions().create(
-        fileId=file_id, body={"role": "reader", "type": "anyone"}
-    ).execute()
-
-    # Format URL ini bisa langsung dibaca sebagai gambar oleh formula =IMAGE(...)
-    return f"https://drive.google.com/uc?export=view&id={file_id}"
+@app.route("/foto/<path:filename>", methods=["GET"])
+def serve_foto(filename):
+    """Serve foto yang sudah disimpan supaya bisa diakses publik oleh formula
+    IMAGE() di Google Sheets (Sheets butuh URL yang bisa diakses tanpa login)."""
+    return send_from_directory(BASE_FOTO_DIR, filename)
 
 
 def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
     """Handle foto yang dikirim user (biasanya sebagai reply ke ringkasan laporan).
-    Foto diupload ke Drive lalu disisipkan ke kolom Gambar (kolom I) pada baris yang sesuai,
-    memakai formula IMAGE(url, 1) supaya ukurannya otomatis menyesuaikan ukuran cell."""
+    Foto disimpan di server ini sendiri lalu disisipkan ke kolom Gambar (kolom I)
+    pada baris yang sesuai, memakai formula IMAGE(url, 1) supaya ukurannya otomatis
+    menyesuaikan ukuran cell."""
+    if not PUBLIC_BASE_URL:
+        kirim_pesan(
+            chat_id,
+            "Fitur foto belum aktif: env var PUBLIC_BASE_URL belum diisi di server "
+            "(isi dengan URL publik bot ini, misal https://nama-app.up.railway.app). "
+            "Hubungi admin bot.",
+        )
+        return
+
     local_path = None
     try:
         # Tentukan baris tujuan: prioritas baris dari pesan yang di-reply,
@@ -549,11 +574,17 @@ def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
             )
             return
 
-        kirim_pesan(chat_id, f"Menerima foto, mengunggah ke baris {target_row}...")
+        kirim_pesan(chat_id, f"Menerima foto, menyimpan ke baris {target_row}...")
 
         local_path = download_telegram_file(file_id, suffix=".jpg")
-        nama_file = f"laporan_baris{target_row}_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.jpg"
-        url_gambar = upload_foto_ke_drive(local_path, nama_file)
+
+        os.makedirs(FOTO_SHEET_DIR, exist_ok=True)
+        nama_file = f"baris{target_row}_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.jpg"
+        tujuan = os.path.join(FOTO_SHEET_DIR, nama_file)
+        os.replace(local_path, tujuan)
+        local_path = None  # sudah dipindah, tidak perlu dihapus lagi di finally
+
+        url_gambar = f"{PUBLIC_BASE_URL}/foto/sheet_gambar/{nama_file}"
 
         ws = get_sheet()
         ws.update(
@@ -565,7 +596,7 @@ def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
         kirim_pesan(chat_id, f"Foto tersimpan di kolom Gambar, baris {target_row}.")
     except Exception as e:
         logger.exception("Gagal proses foto laporan")
-        kirim_pesan(chat_id, f"Gagal mengunggah foto: {e}")
+        kirim_pesan(chat_id, f"Gagal menyimpan foto: {e}")
     finally:
         if local_path and os.path.exists(local_path):
             os.remove(local_path)
@@ -753,18 +784,15 @@ def kirim_pesan(chat_id, teks: str, reply_markup: dict = None):
 
 
 def kirim_tombol_minta_lokasi(chat_id):
-    """Kirim keyboard dengan tombol yang, saat ditekan, langsung memicu
-    prompt share-location native Telegram (1 tap, tanpa buka menu attachment)."""
-    reply_markup = {
-        "keyboard": [[{"text": "\U0001F4CD Bagikan Lokasi Saya", "request_location": True}]],
-        "resize_keyboard": True,
-        "one_time_keyboard": True,
-    }
+    """Ingatkan user share lokasi kalau belum tercatat untuk shift ini.
+    Tombolnya sama dengan keyboard persisten (main_keyboard) supaya tombol
+    'Mulai Kegiatan Baru' tetap ada juga."""
     kirim_pesan(
         chat_id,
-        "Lokasi kerja belum tercatat untuk shift ini. Tap tombol di bawah untuk membagikan lokasi "
-        "(cukup sekali per shift, lokasi ini akan dipakai otomatis untuk laporan-laporan berikutnya).",
-        reply_markup=reply_markup,
+        "Lokasi kerja belum tercatat untuk shift ini. Tap tombol \U0001F4CD di bawah untuk "
+        "membagikan lokasi (cukup sekali per shift, lokasi ini akan dipakai otomatis "
+        "untuk laporan-laporan berikutnya).",
+        reply_markup=main_keyboard(),
     )
 
 
