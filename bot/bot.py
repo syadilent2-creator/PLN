@@ -22,13 +22,13 @@ import json
 import logging
 import tempfile
 import threading
+import base64
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import requests
-from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -38,7 +38,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "GANTI_DENGAN_TOKEN_BOTMU")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BASE_FOTO_DIR = "foto"
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1vXFzN8nktmBmHUzN9KqkpaIBhHUSmoaXCXQOMb2Q2MY")
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # isi mentah file JSON service account
@@ -50,8 +50,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Cache lokasi terakhir per user, in-memory: { user_id: {"lat":.., "lon":.., "nama":.., "waktu": datetime} }
 LAST_LOCATION = {}
@@ -210,20 +208,39 @@ def proses_location(user_id, chat_id, loc):
 
 def proses_voice_note(user_id, chat_id, file_id):
     try:
-        if not openai_client:
-            kirim_pesan(chat_id, "OPENAI_API_KEY belum diset di server. Hubungi admin bot.")
+        if not GEMINI_API_KEY:
+            kirim_pesan(chat_id, "GEMINI_API_KEY belum diset di server. Hubungi admin bot.")
             return
 
         # 1. Download file voice dari Telegram
         audio_path = download_telegram_file(file_id)
 
-        # 2. Transkrip suara -> teks (Whisper)
+        # 2. Transkrip suara -> teks (Gemini)
         with open(audio_path, "rb") as f:
-            transcript = openai_client.audio.transcriptions.create(
-                model="whisper-1", file=f, language="id"
-            )
-        teks = transcript.text.strip()
+            audio_data = base64.b64encode(f.read()).decode("utf-8")
         os.remove(audio_path)
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "inlineData": {
+                            "mimeType": "audio/ogg",
+                            "data": audio_data
+                        }
+                    },
+                    {
+                        "text": "Transkripsikan rekaman suara ini ke dalam teks bahasa Indonesia secara lengkap dan akurat. Jangan tambahkan komentar lain."
+                    }
+                ]
+            }]
+        }
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        res = requests.post(url, json=payload, timeout=30)
+        res.raise_for_status()
+        res_json = res.json()
+        teks = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
 
         if not teks:
             kirim_pesan(chat_id, "Maaf, suara tidak bisa dikenali. Coba rekam ulang lebih jelas.")
@@ -238,8 +255,8 @@ def proses_voice_note(user_id, chat_id, file_id):
 
 def proses_laporan_teks(user_id, chat_id, teks):
     try:
-        if not openai_client:
-            kirim_pesan(chat_id, "OPENAI_API_KEY belum diset di server. Hubungi admin bot.")
+        if not GEMINI_API_KEY:
+            kirim_pesan(chat_id, "GEMINI_API_KEY belum diset di server. Hubungi admin bot.")
             return
         proses_dan_simpan_laporan(user_id, chat_id, teks, sumber="teks")
     except Exception as e:
@@ -296,14 +313,14 @@ def download_telegram_file(file_id: str) -> str:
 
 
 def ekstrak_laporan(teks: str) -> dict:
-    """Minta GPT mengubah transkrip bebas jadi field terstruktur."""
+    """Minta Gemini mengubah transkrip bebas jadi field terstruktur."""
     kategori = ", ".join(KEGIATAN_LABEL.values())
     prompt = f"""Kamu membantu mencatat laporan kerja lapangan PLN dari transkrip suara petugas.
 Kategori kegiatan yang umum dipakai: {kategori}. Kalau tidak cocok satupun, pakai kategori yang paling mendekati atau tulis apa adanya.
 
 Transkrip: \"\"\"{teks}\"\"\"
 
-Balas HANYA dengan JSON valid, tanpa teks lain, format persis:
+Balas HANYA dengan JSON valid, tanpa teks/formatting markdown lain seperti ```json, format persis:
 {{
   "kegiatan": "nama kegiatan singkat",
   "deskripsi": "ringkasan deskripsi kegiatan, 1-2 kalimat, bahasa Indonesia rapi",
@@ -311,16 +328,28 @@ Balas HANYA dengan JSON valid, tanpa teks lain, format persis:
 }}
 Kalau tidak ada material disebutkan, kembalikan "material": []."""
 
-    resp = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {
+                    "text": prompt
+                }
+            ]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+
     try:
-        return json.loads(resp.choices[0].message.content)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        res = requests.post(url, json=payload, timeout=30)
+        res.raise_for_status()
+        res_json = res.json()
+        content = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return json.loads(content)
     except Exception:
-        logger.exception("Gagal parse JSON dari GPT")
+        logger.exception("Gagal parse JSON dari Gemini")
         return {"kegiatan": "", "deskripsi": teks, "material": []}
 
 
