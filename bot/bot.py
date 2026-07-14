@@ -23,6 +23,8 @@ import logging
 import tempfile
 import threading
 import base64
+import random
+import string
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -31,6 +33,7 @@ from dotenv import load_dotenv
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
 
@@ -45,6 +48,12 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # is
 
 TZ = ZoneInfo("Asia/Jakarta")
 HARI_ID = ["SENIN", "SELASA", "RABU", "KAMIS", "JUM'AT", "SABTU", "MINGGU"]
+
+# --- Konfigurasi watermark foto ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_DIR = os.path.join(BASE_DIR, "fonts")
+LOGO_ICON_PATH = os.path.join(BASE_DIR, "assets", "logo_pln_icon.png")
+ULP_NAME = os.getenv("ULP_NAME", "ULP Benubenua")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -78,6 +87,7 @@ def upload():
         kelurahan = request.form.get("kelurahan", "")
         kecamatan = request.form.get("kecamatan", "")
         kota = request.form.get("kota", "")
+        provinsi = request.form.get("provinsi", "")
         photo = request.files.get("photo")
 
         if not photo:
@@ -86,6 +96,7 @@ def upload():
             return jsonify({"status": "error", "message": "user_id tidak ditemukan"}), 400
 
         now = datetime.now(TZ)
+        hari = HARI_ID[now.weekday()]
         tanggal_folder = now.strftime("%Y-%m-%d")
         waktu_file = now.strftime("%H%M%S")
 
@@ -94,6 +105,15 @@ def upload():
         filepath = os.path.join(folder, f"{waktu_file}_{user_id}.jpg")
         photo.save(filepath)
         logger.info(f"Foto disimpan: {filepath}")
+
+        # Tempel watermark PLN (logo, ULP, jam/hari/tanggal, daerah, koordinat) ke foto
+        try:
+            tambah_watermark(
+                filepath, now=now, hari=hari, lat=lat, lon=lon,
+                kecamatan=kecamatan, kota=kota, provinsi=provinsi,
+            )
+        except Exception:
+            logger.exception("Gagal menambahkan watermark, foto tetap dikirim tanpa watermark")
 
         label = KEGIATAN_LABEL.get(kegiatan, kegiatan)
         alamat = ", ".join(filter(None, [jalan, kelurahan]))
@@ -140,6 +160,96 @@ def kirim_foto_ke_telegram(chat_id: str, filepath: str, caption: str):
         )
     if not resp.ok:
         logger.error(f"Gagal kirim ke Telegram: {resp.text}")
+
+
+def _font(name: str, size: int):
+    """Load font dari folder fonts/. Fallback ke font bawaan PIL kalau file tidak ada."""
+    try:
+        return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _generate_kode_foto(n: int = 10) -> str:
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
+
+def tambah_watermark(photo_path: str, now: datetime, hari: str, lat, lon,
+                      kecamatan: str = "", kota: str = "", provinsi: str = "") -> str:
+    """Tempel watermark PLN (logo, nama ULP, jam/hari/tanggal, daerah, koordinat)
+    langsung ke pixel foto (bukan cuma caption Telegram). Overwrite file di photo_path.
+    Return kode_foto yang di-generate (untuk referensi/log kalau perlu)."""
+    base = Image.open(photo_path).convert("RGBA")
+    W, H = base.size
+
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # Gradient gelap di bagian bawah biar teks kebaca jelas di foto apapun
+    band_h = int(H * 0.34)
+    grad = Image.new("L", (1, band_h), color=0)
+    for i in range(band_h):
+        grad.putpixel((0, i), int(220 * (i / band_h)))
+    grad = grad.resize((W, band_h))
+    black = Image.new("RGBA", (W, band_h), (0, 0, 0, 255))
+    black.putalpha(grad)
+    overlay.paste(black, (0, H - band_h), black)
+
+    pad = int(W * 0.045)
+    y = H - band_h + pad
+
+    # Logo + teks "PLN"
+    logo_size = int(W * 0.11)
+    try:
+        logo = Image.open(LOGO_ICON_PATH).convert("RGBA").resize((logo_size, logo_size))
+        overlay.paste(logo, (pad, y), logo)
+    except Exception:
+        logger.warning(f"Logo watermark tidak ditemukan di {LOGO_ICON_PATH}")
+
+    f_pln = _font("DejaVuSans-Bold.ttf", int(W * 0.065))
+    draw.text((pad + logo_size + int(W * 0.025), y + logo_size // 2 - int(W * 0.033)),
+              "PLN", font=f_pln, fill=(255, 255, 255, 255))
+    y += logo_size + int(H * 0.02)
+
+    # Nama ULP
+    f_ulp = _font("DejaVuSans-Bold.ttf", int(W * 0.05))
+    draw.text((pad, y), ULP_NAME.upper(), font=f_ulp, fill=(255, 255, 255, 255))
+    y += int(W * 0.08)
+
+    # Jam | tanggal + hari
+    f_time = _font("DejaVuSans-Bold.ttf", int(W * 0.085))
+    f_date = _font("DejaVuSans.ttf", int(W * 0.045))
+    waktu = now.strftime("%H:%M")
+    tanggal = now.strftime("%d %B %Y")
+    draw.text((pad, y), waktu, font=f_time, fill=(255, 255, 255, 255))
+    tw = draw.textlength(waktu, font=f_time)
+    lx = pad + tw + int(W * 0.025)
+    draw.line([(lx, y + int(W * 0.005)), (lx, y + int(W * 0.08))], fill=(255, 255, 255, 160), width=3)
+    draw.text((lx + int(W * 0.02), y + int(W * 0.005)), tanggal, font=f_date, fill=(255, 255, 255, 255))
+    draw.text((lx + int(W * 0.02), y + int(W * 0.005) + int(W * 0.05)), hari, font=f_date, fill=(255, 255, 255, 230))
+    y += int(W * 0.14)
+
+    # Daerah (kecamatan/kabupaten, provinsi)
+    bagian = [b for b in [kecamatan, kota, provinsi] if b]
+    daerah = ", ".join(bagian) if bagian else "Lokasi tidak diketahui"
+    f_daerah = _font("DejaVuSans.ttf", int(W * 0.04))
+    draw.text((pad, y), daerah, font=f_daerah, fill=(255, 255, 255, 255))
+    y += int(W * 0.062)
+
+    # Koordinat
+    f_koor = _font("DejaVuSans.ttf", int(W * 0.033))
+    draw.text((pad, y), f"Koordinat: {lat}, {lon}", font=f_koor, fill=(230, 230, 230, 255))
+
+    # Kode foto (referensi unik, pojok kanan bawah)
+    kode = _generate_kode_foto()
+    f_kode = _font("DejaVuSans.ttf", int(W * 0.026))
+    kode_txt = f"Kode Foto: {kode}"
+    kw = draw.textlength(kode_txt, font=f_kode)
+    draw.text((W - kw - pad, H - pad // 2 - int(W * 0.03)), kode_txt, font=f_kode, fill=(255, 255, 255, 190))
+
+    hasil = Image.alpha_composite(base, overlay).convert("RGB")
+    hasil.save(photo_path, quality=92)
+    return kode
 
 
 # ======================================================================
@@ -217,7 +327,11 @@ def proses_location(user_id, chat_id, loc):
         logger.exception("Gagal reverse geocode lokasi")
 
     LAST_LOCATION[user_id] = {"lat": lat, "lon": lon, "nama": nama, "waktu": datetime.now(TZ)}
-    kirim_pesan(chat_id, f"Lokasi tersimpan: {nama}\nAkan dipakai untuk laporan suara berikutnya.")
+    kirim_pesan(
+        chat_id,
+        f"Lokasi tersimpan: {nama}\nAkan dipakai otomatis untuk laporan-laporan berikutnya.",
+        reply_markup={"remove_keyboard": True},
+    )
 
 
 def proses_voice_note(user_id, chat_id, file_id):
@@ -283,8 +397,10 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
     """Inti bersama: ekstraksi AI -> tulis ke sheet -> balas ke user.
     Dipakai baik untuk laporan dari voice note maupun teks ketikan."""
 
-    # 1. Ekstraksi terstruktur -> JSON (GPT)
+    # 1. Ekstraksi terstruktur -> JSON (GPT), untuk ambil kegiatan & material saja
     data = ekstrak_laporan(teks)
+    # Deskripsi selalu pakai teks lengkap apa adanya (bukan potongan hasil AI)
+    data["deskripsi"] = teks
 
     # 2. Tulis ke Google Sheet
     now = datetime.now(TZ)
@@ -295,7 +411,7 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
     # 3. Balas ringkasan ke user
     u_id = int(user_id) if str(user_id).isdigit() else user_id
     loc = LAST_LOCATION.get(u_id) or LAST_LOCATION.get(str(u_id))
-    lokasi_teks = loc["nama"] if loc else "(belum ada lokasi, share lokasi dulu)"
+    lokasi_teks = loc["nama"] if loc else "(belum ada lokasi)"
 
     material_teks = "\n".join(
         f"  \u2022 {m['nama']} - {m['jumlah']}" for m in data.get("material", [])
@@ -312,6 +428,10 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
         f"{sumber_teks}"
     )
     kirim_pesan(chat_id, balasan)
+
+    # Kalau lokasi belum tercatat, langsung susulkan tombol share-location 1-tap
+    if not loc:
+        kirim_tombol_minta_lokasi(chat_id)
 
 
 def download_telegram_file(file_id: str) -> str:
@@ -331,7 +451,7 @@ def download_telegram_file(file_id: str) -> str:
 def ekstrak_laporan(teks: str) -> dict:
     """Minta Gemini mengubah transkrip bebas jadi field terstruktur."""
     kategori = ", ".join(KEGIATAN_LABEL.values())
-    prompt = f"""Kamu adalah asisten pencatatan laporan lapangan PLN. Tugasmu adalah mengekstrak teks laporan menjadi format JSON terstruktur.
+    prompt = f"""Kamu adalah asisten pencatatan laporan lapangan PLN. Tugasmu adalah mengekstrak teks laporan menjadi format JSON terstruktur berisi "kegiatan" dan "material" saja.
 
 Aturan Ekstraksi Laporan:
 1. Kalimat atau bagian pertama dari teks menjelaskan "kegiatan". Kamu WAJIB mencocokkan dan memilih salah satu dari kategori resmi berikut (tulis persis sama):
@@ -342,16 +462,13 @@ Aturan Ekstraksi Laporan:
    - INSPEKSI JTM
    Pilih yang paling sesuai.
 
-2. Kalimat atau bagian kedua menjelaskan "deskripsi" detail dari kegiatan tersebut. Ambil HANYA bagian kedua ini sebagai deskripsi (jangan masukkan kalimat pertama atau ketiga).
-
-3. Kalimat atau bagian ketiga menjelaskan "material" yang digunakan beserta "jumlah" nya. Pisahkan dengan jelas antara nama material dan jumlahnya.
+2. Kalimat atau bagian ketiga (atau bagian manapun yang menyebutkan barang/komponen) menjelaskan "material" yang digunakan beserta "jumlah" nya. Pisahkan dengan jelas antara nama material dan jumlahnya.
 
 Contoh Ekstraksi:
 Teks: "Inspeksi gardu, cek kondisi trafo aman, ganti isolator 3 buah"
 Output JSON:
 {{
   "kegiatan": "INSPEKSI GARDU",
-  "deskripsi": "cek kondisi trafo aman",
   "material": [
     {{
       "nama": "isolator",
@@ -365,11 +482,10 @@ Teks Laporan: \"\"\"{teks}\"\"\"
 Balas HANYA dengan JSON valid tanpa formatting markdown seperti ```json atau penjelas lainnya. Format JSON harus persis seperti ini:
 {{
   "kegiatan": "PILIH SALAH SATU: EMERGENCY / INSPEKSI GARDU / PEMELIHARAAN / ROW / INSPEKSI JTM",
-  "deskripsi": "deskripsi kegiatan dari kalimat/bagian kedua",
   "material": [
     {{
-      "nama": "nama material dari kalimat/bagian ketiga",
-      "jumlah": "jumlah + satuan dari kalimat/bagian ketiga"
+      "nama": "nama material yang disebutkan",
+      "jumlah": "jumlah + satuan"
     }}
   ]
 }}
@@ -466,11 +582,26 @@ def tulis_ke_sheet(hari: str, tanggal: str, data: dict) -> int:
     return target_row
 
 
-def kirim_pesan(chat_id, teks: str):
-    requests.post(
-        f"{TELEGRAM_API}/sendMessage",
-        json={"chat_id": chat_id, "text": teks, "parse_mode": "Markdown"},
-        timeout=15,
+def kirim_pesan(chat_id, teks: str, reply_markup: dict = None):
+    payload = {"chat_id": chat_id, "text": teks, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=15)
+
+
+def kirim_tombol_minta_lokasi(chat_id):
+    """Kirim keyboard dengan tombol yang, saat ditekan, langsung memicu
+    prompt share-location native Telegram (1 tap, tanpa buka menu attachment)."""
+    reply_markup = {
+        "keyboard": [[{"text": "\U0001F4CD Bagikan Lokasi Saya", "request_location": True}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+    kirim_pesan(
+        chat_id,
+        "Lokasi kerja belum tercatat untuk shift ini. Tap tombol di bawah untuk membagikan lokasi "
+        "(cukup sekali per shift, lokasi ini akan dipakai otomatis untuk laporan-laporan berikutnya).",
+        reply_markup=reply_markup,
     )
 
 
