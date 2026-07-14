@@ -427,9 +427,9 @@ def proses_voice_note(user_id, chat_id, file_id):
             }]
         }
 
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
-        res = requests.post(url, headers=headers, json=payload, timeout=30)
+        res = requests.post(url, headers=headers, json=payload, timeout=90)
         res.raise_for_status()
         res_json = res.json()
         teks = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -755,9 +755,9 @@ Jika tidak ada material yang digunakan, isi "material": []."""
 
     res = None
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
-        res = requests.post(url, headers=headers, json=payload, timeout=30)
+        res = requests.post(url, headers=headers, json=payload, timeout=60)
         res.raise_for_status()
         res_json = res.json()
         content = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
