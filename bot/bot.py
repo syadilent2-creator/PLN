@@ -395,6 +395,16 @@ Jika tidak ada material yang digunakan, isi "material": []."""
         res.raise_for_status()
         res_json = res.json()
         content = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+        
+        # Bersihkan pembungkus markdown ```json ... ``` jika ada
+        if content.startswith("```"):
+            lines = content.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            content = "\n".join(lines).strip()
+            
         return json.loads(content)
     except Exception:
         logger.exception("Gagal parse JSON dari Gemini")
