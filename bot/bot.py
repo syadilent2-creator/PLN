@@ -23,6 +23,7 @@ import logging
 import re
 import tempfile
 import threading
+import time
 import base64
 import random
 import string
@@ -44,6 +45,57 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BASE_FOTO_DIR = "foto"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
+# (connect_timeout, read_timeout) detik. Transkrip audio & ekstraksi JSON kadang butuh
+# waktu lebih dari 30 detik terutama untuk VN yang agak panjang, jadi dinaikkan + ada retry.
+GEMINI_TIMEOUT = (10, 90)
+GEMINI_MAX_RETRY = 3
+GEMINI_RETRY_BACKOFF = [3, 8]  # jeda (detik) sebelum percobaan ke-2 dan ke-3
+
+
+def panggil_gemini(payload: dict):
+    """Panggil Gemini generateContent dengan timeout longgar + retry otomatis
+    (dengan jeda/backoff) kalau kena timeout atau server Gemini sendiri lagi
+    sibuk/overload (503/5xx). Tanpa jeda, retry langsung bisa kena server yang
+    sama yang masih sibuk, jadi percuma."""
+    headers = {"x-goog-api-key": GEMINI_API_KEY}
+    percobaan_terakhir_error = None
+    for percobaan in range(1, GEMINI_MAX_RETRY + 1):
+        if percobaan > 1:
+            jeda = GEMINI_RETRY_BACKOFF[min(percobaan - 2, len(GEMINI_RETRY_BACKOFF) - 1)]
+            time.sleep(jeda)
+        try:
+            res = requests.post(GEMINI_URL, headers=headers, json=payload, timeout=GEMINI_TIMEOUT)
+            res.raise_for_status()
+            return res
+        except requests.Timeout as e:
+            percobaan_terakhir_error = e
+            logger.warning(f"Gemini API timeout (percobaan {percobaan}/{GEMINI_MAX_RETRY})")
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is not None and status < 500:
+                raise  # error client (400/403/404 dst) tidak perlu diulang, langsung lempar
+            percobaan_terakhir_error = e
+            logger.warning(f"Gemini API error {status} (percobaan {percobaan}/{GEMINI_MAX_RETRY})")
+        except requests.ConnectionError as e:
+            percobaan_terakhir_error = e
+            logger.warning(f"Gemini API connection error (percobaan {percobaan}/{GEMINI_MAX_RETRY})")
+    raise percobaan_terakhir_error
+
+
+def pesan_error_gemini(e: Exception) -> str:
+    """Ubah error teknis dari Gemini jadi pesan yang enak dibaca user biasa."""
+    if isinstance(e, requests.Timeout):
+        return "Server AI lambat merespons (timeout). Coba lagi dalam beberapa saat."
+    if isinstance(e, requests.HTTPError):
+        status = e.response.status_code if e.response is not None else None
+        if status == 503 or status == 429:
+            return "Server AI sedang sibuk/overload. Coba lagi dalam 1-2 menit ya."
+        if status in (401, 403):
+            return "GEMINI_API_KEY bermasalah (ditolak server). Hubungi admin bot."
+        return f"Server AI mengalami gangguan (kode {status}). Coba lagi sebentar."
+    return f"Gagal memproses laporan: {e}"
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1vXFzN8nktmBmHUzN9KqkpaIBhHUSmoaXCXQOMb2Q2MY")
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # isi mentah file JSON service account
@@ -551,10 +603,7 @@ def proses_voice_note(user_id, chat_id, file_id):
             }]
         }
 
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
-        headers = {"x-goog-api-key": GEMINI_API_KEY}
-        res = requests.post(url, headers=headers, json=payload, timeout=30)
-        res.raise_for_status()
+        res = panggil_gemini(payload)
         res_json = res.json()
         teks = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
 
@@ -564,6 +613,9 @@ def proses_voice_note(user_id, chat_id, file_id):
 
         proses_dan_simpan_laporan(user_id, chat_id, teks, sumber="suara")
 
+    except (requests.Timeout, requests.HTTPError, requests.ConnectionError) as e:
+        logger.exception("Gagal transkrip voice note (error Gemini)")
+        kirim_pesan(chat_id, pesan_error_gemini(e))
     except Exception as e:
         logger.exception("Gagal proses voice note")
         kirim_pesan(chat_id, f"Gagal memproses laporan: {e}")
@@ -575,6 +627,9 @@ def proses_laporan_teks(user_id, chat_id, teks):
             kirim_pesan(chat_id, "GEMINI_API_KEY belum diset di server. Hubungi admin bot.")
             return
         proses_dan_simpan_laporan(user_id, chat_id, teks, sumber="teks")
+    except (requests.Timeout, requests.HTTPError, requests.ConnectionError) as e:
+        logger.exception("Gagal proses laporan teks (error Gemini)")
+        kirim_pesan(chat_id, pesan_error_gemini(e))
     except Exception as e:
         logger.exception("Gagal proses laporan teks")
         kirim_pesan(chat_id, f"Gagal memproses laporan: {e}")
@@ -667,8 +722,11 @@ FOTO_SHEET_DIR = os.path.join(BASE_FOTO_DIR, "sheet_gambar")
 @app.route("/foto/<path:filename>", methods=["GET"])
 def serve_foto(filename):
     """Serve foto yang sudah disimpan supaya bisa diakses publik oleh formula
-    IMAGE() di Google Sheets (Sheets butuh URL yang bisa diakses tanpa login)."""
-    return send_from_directory(BASE_FOTO_DIR, filename)
+    IMAGE() di Google Sheets (Sheets butuh URL yang bisa diakses tanpa login,
+    dengan Content-Type gambar yang eksplisit dan tanpa perlu autentikasi)."""
+    resp = send_from_directory(BASE_FOTO_DIR, filename, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
@@ -708,8 +766,17 @@ def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
         os.makedirs(FOTO_SHEET_DIR, exist_ok=True)
         nama_file = f"baris{target_row}_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.jpg"
         tujuan = os.path.join(FOTO_SHEET_DIR, nama_file)
-        os.replace(local_path, tujuan)
-        local_path = None  # sudah dipindah, tidak perlu dihapus lagi di finally
+
+        # Kompres/resize foto sebelum disimpan: Google Sheets IMAGE() punya batas ukuran
+        # file, dan foto asli dari kamera HP kadang cukup besar (beberapa MB). Diperkecil
+        # ke maks 1280px sisi terpanjang + kualitas JPEG 85% supaya jauh di bawah batas
+        # dan lebih cepat di-fetch oleh Sheets.
+        with Image.open(local_path) as img:
+            img = img.convert("RGB")  # jaga-jaga kalau ada channel alpha/mode aneh
+            img.thumbnail((1280, 1280))
+            img.save(tujuan, format="JPEG", quality=85, optimize=True)
+        os.remove(local_path)
+        local_path = None  # sudah diproses & dihapus, tidak perlu dihapus lagi di finally
 
         url_gambar = f"{PUBLIC_BASE_URL}/foto/sheet_gambar/{nama_file}"
 
@@ -827,12 +894,8 @@ Jika tidak ada material yang digunakan, isi "material": []."""
     }
 
     hasil = {"kegiatan": kegiatan_kw or "", "material": list(material_regex)}
-    res = None
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
-        headers = {"x-goog-api-key": GEMINI_API_KEY}
-        res = requests.post(url, headers=headers, json=payload, timeout=30)
-        res.raise_for_status()
+        res = panggil_gemini(payload)
         res_json = res.json()
         content = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
 
@@ -866,11 +929,14 @@ Jika tidak ada material yang digunakan, isi "material": []."""
                 nama_sudah_ada.add(nama.lower())
 
         return hasil
-    except requests.HTTPError:
+    except requests.Timeout:
+        logger.warning("Gemini API timeout saat ekstraksi, pakai hasil deteksi kata kunci saja")
+        return hasil
+    except requests.HTTPError as e:
         # Log body respons Gemini biar kelihatan pesan error aslinya (mis. 400/404 karena
         # endpoint/model/API key salah), bukan cuma "gagal parse JSON"
-        body = res.text if res is not None else "(tidak ada respons)"
-        status = res.status_code if res is not None else "?"
+        body = e.response.text if e.response is not None else "(tidak ada respons)"
+        status = e.response.status_code if e.response is not None else "?"
         logger.error(f"Gemini API error {status}: {body}")
         return hasil
     except Exception:
