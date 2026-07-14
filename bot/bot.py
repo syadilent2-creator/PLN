@@ -17,10 +17,10 @@ Jalankan:
     python bot.py
 """
 
-import io
 import os
 import json
 import logging
+import re
 import tempfile
 import threading
 import base64
@@ -30,13 +30,11 @@ from typing import Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from dotenv import load_dotenv
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
@@ -50,14 +48,14 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1vXFzN8nktmBmHUzN9KqkpaIBhHUSmoaXC
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # isi mentah file JSON service account
 
-# ID folder Google Drive tujuan simpan foto (opsional, isi via env var)
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")
+# URL publik backend ini sendiri (Railway/dst), dipakai supaya Google Sheets bisa
+# mengambil foto yang di-reply user lewat formula IMAGE(). WAJIB diisi untuk fitur
+# foto -> kolom Gambar. Railway biasanya kasih domain seperti https://xxxx.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-# Scope Sheets + Drive (dibutuhkan untuk upload foto ke Google Drive)
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+# Scope Sheets biasa saja (fitur foto sekarang di-host sendiri, bukan lewat Google Drive,
+# jadi tidak butuh scope Drive / kena masalah "service account tidak punya storage quota")
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 TZ = ZoneInfo("Asia/Jakarta")
 HARI_ID = ["SENIN", "SELASA", "RABU", "KAMIS", "JUM'AT", "SABTU", "MINGGU"]
@@ -91,6 +89,132 @@ KEGIATAN_LABEL = {
     "row": "ROW",
     "inspeksi_jtm": "INSPEKSI JTM",
 }
+
+# ======================================================================
+# PENCOCOKAN KEGIATAN BERDASARKAN KATA KUNCI (deterministik, bukan tebakan AI)
+# ======================================================================
+# Analoginya seperti admin manusia yang scan kalimat laporan dan langsung tahu
+# ini masuk kategori apa dari kata yang benar-benar disebut. Kalau ada kata
+# kunci yang cocok, hasil ini akan MENANG dibanding tebakan AI.
+#
+# "primer" = kata yang hampir selalu berarti kategori itu (bobot besar), sedangkan
+# "sekunder" = kata konteks pendukung yang bisa juga muncul di kategori lain
+# (bobot kecil). Ini penting supaya kata seperti "PHPTR" (sekunder utk INSPEKSI GARDU)
+# tidak mengalahkan kata "pemeliharaan" (primer utk PEMELIHARAAN) kalau dua-duanya
+# muncul dalam satu laporan.
+KEGIATAN_KEYWORDS = {
+    "EMERGENCY": {
+        "primer": ["emergency", "darurat"],
+        "sekunder": [
+            "gangguan mendadak", "padam mendadak", "padam total", "black out",
+            "blackout", "tumbang", "roboh", "kebakaran", "terbakar", "longsor",
+            "kecelakaan", "gangguan tiba-tiba", "putus mendadak", "trip mendadak",
+            "konslet", "korsleting",
+        ],
+    },
+    "ROW": {
+        "primer": ["row", "right of way", "pemangkasan", "penebangan"],
+        "sekunder": [
+            "memangkas", "pangkas pohon", "tebang", "menebang", "vegetasi",
+            "ranting", "jalur kabel", "lintasan kabel", "pohon mengganggu",
+            "pohon",
+        ],
+    },
+    "INSPEKSI GARDU": {
+        "primer": [
+            "inspeksi gardu", "cek gardu", "periksa gardu", "patroli gardu",
+            "inspeksi trafo",
+        ],
+        "sekunder": [
+            "kondisi gardu", "cek trafo", "periksa trafo", "kondisi trafo",
+            "phptr", "kubikel", "panel hubung", "gardu distribusi", "box gardu",
+            "gardu", "trafo",
+        ],
+    },
+    "INSPEKSI JTM": {
+        "primer": [
+            "inspeksi jtm", "cek jtm", "periksa jtm", "patroli jtm",
+            "inspeksi tiang",
+        ],
+        "sekunder": [
+            "patroli jaringan", "cek tiang", "periksa tiang", "kondisi tiang",
+            "jaringan tegangan menengah", "andongan", "cek jaringan",
+            "periksa jaringan", "tiang", "jtm", "kawat", "konduktor",
+        ],
+    },
+    "PEMELIHARAAN": {
+        "primer": ["pemeliharaan", "perawatan", "maintenance"],
+        "sekunder": [
+            "preventif", "penggantian rutin", "pembersihan", "bersihkan",
+            "mengencangkan", "kencangkan baut", "perbaikan rutin",
+        ],
+    },
+}
+BOBOT_PRIMER = 3
+BOBOT_SEKUNDER = 1
+# Urutan prioritas kalau ada skor kata kunci yang seri (kategori lebih spesifik menang)
+KEGIATAN_PRIORITY = ["EMERGENCY", "ROW", "INSPEKSI GARDU", "INSPEKSI JTM", "PEMELIHARAAN"]
+
+
+def deteksi_kegiatan_dari_kata_kunci(teks: str) -> Optional[str]:
+    """Cocokkan teks laporan ke salah satu dari 5 kategori resmi berdasarkan
+    kata/kalimat yang benar-benar muncul di deskripsi (bukan tebakan bebas AI).
+    Return None kalau tidak ada kata kunci yang cocok sama sekali."""
+    teks_lower = teks.lower()
+    skor = {kat: 0 for kat in KEGIATAN_PRIORITY}
+    for kat, grup in KEGIATAN_KEYWORDS.items():
+        for kw in grup["primer"]:
+            if kw in teks_lower:
+                skor[kat] += BOBOT_PRIMER
+        for kw in grup["sekunder"]:
+            if kw in teks_lower:
+                skor[kat] += BOBOT_SEKUNDER
+    skor_tertinggi = max(skor.values())
+    if skor_tertinggi == 0:
+        return None
+    kandidat = [kat for kat, s in skor.items() if s == skor_tertinggi]
+    for kat in KEGIATAN_PRIORITY:  # tie-break: kategori paling spesifik menang
+        if kat in kandidat:
+            return kat
+    return kandidat[0]
+
+
+# ======================================================================
+# PENCOCOKAN MATERIAL & JUMLAH BERDASARKAN POLA KATA (regex, deterministik)
+# ======================================================================
+# Pola: <kata kerja pemakaian/penggantian> <nama barang> [sebanyak] <angka> [satuan]
+# Contoh yang tertangkap: "ganti isolator 3 buah", "menggunakan kabel schoen sebanyak 2 pcs"
+_KATA_KERJA_MATERIAL = (
+    r"(?:mengganti|penggantian|ganti|memasang|pemasangan|pasang|"
+    r"menggunakan|gunakan|menambahkan|tambah)"
+)
+_SATUAN = (
+    r"(?:buah|pcs|pc|unit|meter|mtr|m|set|batang|btg|roll|lembar|butir|liter|ltr|box)"
+)
+MATERIAL_REGEX = re.compile(
+    rf"{_KATA_KERJA_MATERIAL}\s+([a-zA-Z0-9\-\s]{{2,40}}?)\s+(?:sebanyak\s+)?(\d+(?:[.,]\d+)?)\s*({_SATUAN})?",
+    re.IGNORECASE,
+)
+
+
+def deteksi_material_regex(teks: str) -> list:
+    """Cari pasangan (nama material, jumlah) langsung dari kata kerja pemakaian/
+    penggantian + angka yang mengikutinya. Deterministik, tidak bergantung ke AI."""
+    hasil = []
+    seen = set()
+    for m in MATERIAL_REGEX.finditer(teks):
+        nama = m.group(1).strip(" ,.-")
+        angka = m.group(2).strip()
+        satuan = (m.group(3) or "").strip()
+        if not nama:
+            continue
+        key = nama.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        jumlah = f"{angka} {satuan}".strip() if satuan else angka
+        hasil.append({"nama": nama, "jumlah": jumlah})
+    return hasil
 
 # --- Label tombol keyboard persisten (share lokasi + mulai kegiatan baru) ---
 TOMBOL_LOKASI = "\U0001F4CD Bagikan Lokasi Saya"
@@ -427,9 +551,9 @@ def proses_voice_note(user_id, chat_id, file_id):
             }]
         }
 
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
-        res = requests.post(url, headers=headers, json=payload, timeout=90)
+        res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
         res_json = res.json()
         teks = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -529,108 +653,39 @@ def download_telegram_file(file_id: str, suffix: str = ".oga") -> str:
 
 
 # ======================================================================
-# 3. FOTO SEBAGAI REPLY -> UPLOAD KE GOOGLE DRIVE -> EMBED KE CELL
+# 3. [BARU] FOTO SEBAGAI REPLY -> HOST SENDIRI DI BACKEND -> KOLOM GAMBAR
 # ======================================================================
-# Foto di-upload ke Google Drive menggunakan service account (persistent,
-# tidak bergantung filesystem Railway yang ephemeral).
-# Gambar disisipkan langsung ke dalam cell kolom I menggunakan Sheets API
-# batchUpdate dengan tipe `image` — otomatis menyesuaikan ukuran cell.
+# Kenapa tidak upload ke Google Drive? Karena Drive milik service account TIDAK
+# punya storage quota sendiri (khusus akun Gmail biasa/non-Workspace, ini akan
+# selalu gagal dengan error "storageQuotaExceeded"). Solusinya: foto disimpan di
+# disk server ini sendiri (folder foto/sheet_gambar/) lalu di-serve lewat endpoint
+# publik /foto/<path>, dan URL itu yang dipakai formula IMAGE() di Google Sheets.
+
+FOTO_SHEET_DIR = os.path.join(BASE_FOTO_DIR, "sheet_gambar")
 
 
-def get_google_creds() -> Credentials:
-    """Credentials dengan scope Sheets + Drive."""
-    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    return Credentials.from_service_account_info(creds_dict, scopes=GOOGLE_SCOPES)
-
-
-def upload_ke_drive(foto_bytes: bytes, nama_file: str) -> str:
-    """
-    Upload bytes foto ke Google Drive menggunakan service account.
-    File dibuat publik (anyone reader) agar bisa dirender oleh Sheets API.
-    Kembalikan URL langsung gambar.
-    """
-    creds     = get_google_creds()
-    drive_svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-
-    file_meta = {"name": nama_file, "mimeType": "image/jpeg"}
-    if DRIVE_FOLDER_ID:
-        file_meta["parents"] = [DRIVE_FOLDER_ID]
-
-    media  = MediaIoBaseUpload(io.BytesIO(foto_bytes), mimetype="image/jpeg", resumable=False)
-    result = drive_svc.files().create(
-        body=file_meta, media_body=media, fields="id"
-    ).execute()
-    file_id = result["id"]
-
-    # Izinkan siapa saja melihat file
-    drive_svc.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"}
-    ).execute()
-
-    url = f"https://drive.google.com/uc?export=view&id={file_id}"
-    logger.info(f"Foto diunggah ke Drive: {url}")
-    return url
-
-
-def sisipkan_gambar_ke_cell(baris: int, foto_url: str):
-    """
-    Sisipkan gambar LANGSUNG ke dalam cell I{baris} menggunakan Sheets API batchUpdate.
-    Tipe `image` pada userEnteredValue membuat gambar tampil di dalam cell
-    dan otomatis menyesuaikan ukuran cell (bukan overlay, bukan formula).
-    """
-    creds      = get_google_creds()
-    sheets_svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-    # Ambil sheetId berdasarkan SHEET_NAME
-    meta = sheets_svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    sheet_id = next(
-        s["properties"]["sheetId"]
-        for s in meta["sheets"]
-        if s["properties"]["title"] == SHEET_NAME
-    )
-
-    body = {
-        "requests": [{
-            "updateCells": {
-                "rows": [{
-                    "values": [{
-                        "userEnteredValue": {
-                            "image": {
-                                "sourceUri": foto_url,
-                                "altText":   "Foto lapangan"
-                            }
-                        }
-                    }]
-                }],
-                "fields": "userEnteredValue.image",
-                "range": {
-                    "sheetId":          sheet_id,
-                    "startRowIndex":    baris - 1,   # 0-indexed
-                    "endRowIndex":      baris,
-                    "startColumnIndex": 8,            # kolom I (0-indexed)
-                    "endColumnIndex":   9
-                }
-            }
-        }]
-    }
-
-    sheets_svc.spreadsheets().batchUpdate(
-        spreadsheetId=SPREADSHEET_ID, body=body
-    ).execute()
-    logger.info(f"Gambar berhasil disisipkan ke cell I{baris}")
+@app.route("/foto/<path:filename>", methods=["GET"])
+def serve_foto(filename):
+    """Serve foto yang sudah disimpan supaya bisa diakses publik oleh formula
+    IMAGE() di Google Sheets (Sheets butuh URL yang bisa diakses tanpa login)."""
+    return send_from_directory(BASE_FOTO_DIR, filename)
 
 
 def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
-    """
-    Handle foto yang dikirim user (biasanya sebagai reply ke ringkasan laporan).
-    Alur:
-      1. Download bytes foto dari Telegram
-      2. Upload ke Google Drive (persistent, publik)
-      3. Sisipkan gambar langsung ke cell I pada baris yang sesuai
-         menggunakan Sheets API — gambar menyesuaikan ukuran cell otomatis.
-    """
-    local_bytes = None
+    """Handle foto yang dikirim user (biasanya sebagai reply ke ringkasan laporan).
+    Foto disimpan di server ini sendiri lalu disisipkan ke kolom Gambar (kolom I)
+    pada baris yang sesuai, memakai formula IMAGE(url, 1) supaya ukurannya otomatis
+    menyesuaikan ukuran cell."""
+    if not PUBLIC_BASE_URL:
+        kirim_pesan(
+            chat_id,
+            "Fitur foto belum aktif: env var PUBLIC_BASE_URL belum diisi di server "
+            "(isi dengan URL publik bot ini, misal https://nama-app.up.railway.app). "
+            "Hubungi admin bot.",
+        )
+        return
+
+    local_path = None
     try:
         # Tentukan baris tujuan: prioritas baris dari pesan yang di-reply,
         # fallback ke laporan terakhir user ini kalau reply tidak spesifik/tidak ada.
@@ -646,30 +701,47 @@ def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
             )
             return
 
-        kirim_pesan(chat_id, f"📤 Menerima foto, sedang diunggah ke Drive...")
+        kirim_pesan(chat_id, f"Menerima foto, menyimpan ke baris {target_row}...")
 
-        # 1. Download bytes dari Telegram
         local_path = download_telegram_file(file_id, suffix=".jpg")
-        with open(local_path, "rb") as f:
-            local_bytes = f.read()
-        os.remove(local_path)
 
-        # 2. Upload ke Google Drive
+        os.makedirs(FOTO_SHEET_DIR, exist_ok=True)
         nama_file = f"baris{target_row}_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.jpg"
-        foto_url  = upload_ke_drive(local_bytes, nama_file)
+        tujuan = os.path.join(FOTO_SHEET_DIR, nama_file)
+        os.replace(local_path, tujuan)
+        local_path = None  # sudah dipindah, tidak perlu dihapus lagi di finally
 
-        # 3. Sisipkan gambar ke cell I (bukan formula, tapi nilai gambar langsung)
-        sisipkan_gambar_ke_cell(target_row, foto_url)
+        url_gambar = f"{PUBLIC_BASE_URL}/foto/sheet_gambar/{nama_file}"
 
-        kirim_pesan(chat_id, f"🖼️ Foto berhasil disisipkan ke kolom Gambar, baris {target_row}.")
+        ws = get_sheet()
+        ws.update(
+            f"I{target_row}:I{target_row}",
+            [[f'=IMAGE("{url_gambar}", 1)']],
+            value_input_option="USER_ENTERED",
+        )
 
+        kirim_pesan(chat_id, f"Foto tersimpan di kolom Gambar, baris {target_row}.")
     except Exception as e:
         logger.exception("Gagal proses foto laporan")
-        kirim_pesan(chat_id, f"❌ Gagal menyimpan foto: {e}")
+        kirim_pesan(chat_id, f"Gagal menyimpan foto: {e}")
+    finally:
+        if local_path and os.path.exists(local_path):
+            os.remove(local_path)
 
 
 def ekstrak_laporan(teks: str) -> dict:
-    """Minta Gemini mengubah transkrip bebas jadi field terstruktur."""
+    """Ekstrak kegiatan & material dari teks laporan.
+    Strategi 2 lapis (seperti admin manusia yang teliti):
+    1. Deteksi berdasarkan kata kunci/pola kata yang PERSIS muncul di teks (deterministik,
+       lewat deteksi_kegiatan_dari_kata_kunci & deteksi_material_regex).
+    2. AI (Gemini) dipakai untuk melengkapi/menormalkan kasus yang tidak tertangkap
+       kata kunci (nama material dengan ejaan bebas, kalimat ambigu, dsb).
+    Kalau kata kunci ketemu, hasil kata kunci itu yang dipakai (menang atas tebakan AI),
+    supaya kegiatan konsisten sesuai kata yang benar-benar disebut di laporan."""
+
+    kegiatan_kw = deteksi_kegiatan_dari_kata_kunci(teks)
+    material_regex = deteksi_material_regex(teks)
+
     kategori = ", ".join(KEGIATAN_LABEL.values())
     prompt = f"""Kamu adalah asisten pencatatan laporan lapangan PLN yang sangat teliti, selayaknya petugas admin manusia yang membaca laporan dari VN (voice note) maupun teks ketikan lalu memindahkannya ke tabel Excel/Spreadsheet. Tugasmu mengekstrak teks laporan menjadi JSON terstruktur berisi "kegiatan" dan "material" saja.
 
@@ -694,6 +766,7 @@ Baca keseluruhan konteks laporan (bukan cuma kata pertama), lalu cocokkan ke SAL
   Ciri-ciri: mengecek/memeriksa/patroli kondisi JARINGAN TEGANGAN MENENGAH (JTM) di LUAR gardu — tiang listrik, kawat/konduktor, isolator di jaringan, andongan kawat. Kata kunci: "inspeksi JTM", "patroli jaringan", "cek tiang", "cek jaringan".
 
 Jika laporan menyebut kombinasi (misal inspeksi SEKALIGUS ganti komponen), pilih kategori berdasarkan TUJUAN UTAMA kunjungan (inspeksi rutin gardu yang berujung ganti komponen kecil tetap INSPEKSI GARDU; sedangkan penggantian terjadwal skala pemeliharaan masuk PEMELIHARAAN).
+{f'PETUNJUK: hasil pencocokan kata kunci otomatis menunjukkan kategori "{kegiatan_kw}" — pakai ini kecuali konteks laporan jelas-jelas bertentangan.' if kegiatan_kw else ''}
 
 ========================================
 ATURAN 2 - MENENTUKAN "material" dan "jumlah"
@@ -753,15 +826,16 @@ Jika tidak ada material yang digunakan, isi "material": []."""
         }
     }
 
+    hasil = {"kegiatan": kegiatan_kw or "", "material": list(material_regex)}
     res = None
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
-        res = requests.post(url, headers=headers, json=payload, timeout=60)
+        res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
         res_json = res.json()
         content = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-        
+
         # Bersihkan pembungkus markdown ```json ... ``` jika ada
         if content.startswith("```"):
             lines = content.splitlines()
@@ -770,24 +844,46 @@ Jika tidak ada material yang digunakan, isi "material": []."""
             if lines and lines[-1].startswith("```"):
                 lines = lines[:-1]
             content = "\n".join(lines).strip()
-            
-        return json.loads(content)
+
+        ai_result = json.loads(content)
+
+        # --- Kegiatan: kata kunci deterministik MENANG kalau ada, AI cuma fallback ---
+        ai_kegiatan = (ai_result.get("kegiatan") or "").strip().upper()
+        if kegiatan_kw:
+            hasil["kegiatan"] = kegiatan_kw
+        elif ai_kegiatan in KEGIATAN_LABEL.values():
+            hasil["kegiatan"] = ai_kegiatan
+        else:
+            hasil["kegiatan"] = ai_kegiatan or ""
+
+        # --- Material: gabungkan hasil regex (pasti akurat) + tambahan dari AI
+        #     (untuk material yang tidak tertangkap pola regex, misal ejaan bebas dari VN) ---
+        nama_sudah_ada = {m["nama"].strip().lower() for m in hasil["material"]}
+        for m in ai_result.get("material", []):
+            nama = (m.get("nama") or "").strip()
+            if nama and nama.lower() not in nama_sudah_ada:
+                hasil["material"].append({"nama": nama, "jumlah": m.get("jumlah", "-")})
+                nama_sudah_ada.add(nama.lower())
+
+        return hasil
     except requests.HTTPError:
         # Log body respons Gemini biar kelihatan pesan error aslinya (mis. 400/404 karena
         # endpoint/model/API key salah), bukan cuma "gagal parse JSON"
         body = res.text if res is not None else "(tidak ada respons)"
         status = res.status_code if res is not None else "?"
         logger.error(f"Gemini API error {status}: {body}")
-        return {"kegiatan": "", "deskripsi": teks, "material": []}
+        return hasil
     except Exception:
-        logger.exception("Gagal parse JSON dari Gemini")
-        return {"kegiatan": "", "deskripsi": teks, "material": []}
+        logger.exception("Gagal parse JSON dari Gemini, pakai hasil deteksi kata kunci saja")
+        return hasil
 
 
 def get_sheet():
-    creds = get_google_creds()
-    gc    = gspread.authorize(creds)
-    return gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=GOOGLE_SCOPES)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    return sh.worksheet(SHEET_NAME)
 
 
 def format_lokasi(loc: Optional[dict]) -> str:
