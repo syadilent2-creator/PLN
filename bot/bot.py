@@ -100,6 +100,22 @@ def upload():
         label = KEGIATAN_LABEL.get(kegiatan, kegiatan)
         alamat = ", ".join(filter(None, [jalan, kelurahan]))
         wilayah = ", ".join(filter(None, [f"Kec. {kecamatan}" if kecamatan else "", kota]))
+        
+        # Simpan lokasi terbaru ke LAST_LOCATION agar dipakai untuk VN/teks Telegram berikutnya
+        nama_lokasi = ", ".join(filter(None, [alamat, wilayah])) or "Lokasi tidak diketahui"
+        try:
+            u_id = int(user_id) if str(user_id).isdigit() else user_id
+            LAST_LOCATION[u_id] = {
+                "lat": lat,
+                "lon": lon,
+                "nama": nama_lokasi,
+                "waktu": now
+            }
+            LAST_LOCATION[str(user_id)] = LAST_LOCATION[u_id]
+            logger.info(f"Lokasi user {user_id} disimpan dari Mini App: {nama_lokasi}")
+        except Exception:
+            logger.exception("Gagal menyimpan lokasi dari Mini App")
+
         caption_lines = [label, f"{now.strftime('%d %b %Y, %H:%M')} WIB"]
         if alamat:
             caption_lines.append(alamat)
@@ -236,8 +252,9 @@ def proses_voice_note(user_id, chat_id, file_id):
             }]
         }
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-        res = requests.post(url, json=payload, timeout=30)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        headers = {"x-goog-api-key": GEMINI_API_KEY}
+        res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
         res_json = res.json()
         teks = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -278,7 +295,8 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
     baris = tulis_ke_sheet(hari, tanggal, data)
 
     # 3. Balas ringkasan ke user
-    loc = LAST_LOCATION.get(user_id)
+    u_id = int(user_id) if str(user_id).isdigit() else user_id
+    loc = LAST_LOCATION.get(u_id) or LAST_LOCATION.get(str(u_id))
     lokasi_teks = loc["nama"] if loc else "(belum ada lokasi, share lokasi dulu)"
 
     material_teks = "\n".join(
@@ -315,18 +333,29 @@ def download_telegram_file(file_id: str) -> str:
 def ekstrak_laporan(teks: str) -> dict:
     """Minta Gemini mengubah transkrip bebas jadi field terstruktur."""
     kategori = ", ".join(KEGIATAN_LABEL.values())
-    prompt = f"""Kamu membantu mencatat laporan kerja lapangan PLN dari transkrip suara petugas.
-Kategori kegiatan yang umum dipakai: {kategori}. Kalau tidak cocok satupun, pakai kategori yang paling mendekati atau tulis apa adanya.
+    prompt = f"""Kamu adalah asisten pencatatan laporan lapangan PLN. Tugasmu adalah mengekstrak teks laporan menjadi format JSON terstruktur.
 
-Transkrip: \"\"\"{teks}\"\"\"
+Aturan Ekstraksi Laporan:
+1. Kalimat atau bagian pertama dari teks menjelaskan "kegiatan" (misal: "Inspeksi gardu", "Pemeliharaan gardu", "ROW", dll).
+2. Kalimat atau bagian kedua menjelaskan "deskripsi" detail dari kegiatan tersebut (misal: "cek kondisi trafo aman", "pembersihan ranting pohon").
+3. Kalimat atau bagian ketiga menjelaskan "material" yang digunakan beserta "jumlah" nya (misal: "ganti isolator 3 buah" -> nama material: "isolator", jumlah: "3 buah").
 
-Balas HANYA dengan JSON valid, tanpa teks/formatting markdown lain seperti ```json, format persis:
+Kategori kegiatan resmi yang umum: {kategori}. Jika kegiatan tidak cocok dengan kategori resmi, gunakan nama kegiatan singkat dari kalimat pertama.
+
+Teks Laporan: \"\"\"{teks}\"\"\"
+
+Balas HANYA dengan JSON valid tanpa formatting markdown seperti ```json atau penjelas lainnya. Format JSON harus persis seperti ini:
 {{
-  "kegiatan": "nama kegiatan singkat",
-  "deskripsi": "ringkasan deskripsi kegiatan, 1-2 kalimat, bahasa Indonesia rapi",
-  "material": [ {{"nama": "nama material", "jumlah": "jumlah + satuan, contoh: 5 buah"}} ]
+  "kegiatan": "kegiatan dari kalimat/bagian pertama",
+  "deskripsi": "deskripsi kegiatan dari kalimat/bagian kedua",
+  "material": [
+    {{
+      "nama": "nama material dari kalimat/bagian ketiga",
+      "jumlah": "jumlah + satuan dari kalimat/bagian ketiga"
+    }}
+  ]
 }}
-Kalau tidak ada material disebutkan, kembalikan "material": []."""
+Jika tidak ada material yang digunakan, isi "material": []."""
 
     payload = {
         "contents": [{
@@ -342,8 +371,9 @@ Kalau tidak ada material disebutkan, kembalikan "material": []."""
     }
 
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-        res = requests.post(url, json=payload, timeout=30)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        headers = {"x-goog-api-key": GEMINI_API_KEY}
+        res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
         res_json = res.json()
         content = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
