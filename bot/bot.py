@@ -250,7 +250,7 @@ def proses_voice_note(user_id, chat_id, file_id):
             }]
         }
 
-        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
         res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
@@ -388,8 +388,9 @@ Jika tidak ada material yang digunakan, isi "material": []."""
         }
     }
 
+    res = None
     try:
-        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
         headers = {"x-goog-api-key": GEMINI_API_KEY}
         res = requests.post(url, headers=headers, json=payload, timeout=30)
         res.raise_for_status()
@@ -406,6 +407,13 @@ Jika tidak ada material yang digunakan, isi "material": []."""
             content = "\n".join(lines).strip()
             
         return json.loads(content)
+    except requests.HTTPError:
+        # Log body respons Gemini biar kelihatan pesan error aslinya (mis. 400/404 karena
+        # endpoint/model/API key salah), bukan cuma "gagal parse JSON"
+        body = res.text if res is not None else "(tidak ada respons)"
+        status = res.status_code if res is not None else "?"
+        logger.error(f"Gemini API error {status}: {body}")
+        return {"kegiatan": "", "deskripsi": teks, "material": []}
     except Exception:
         logger.exception("Gagal parse JSON dari Gemini")
         return {"kegiatan": "", "deskripsi": teks, "material": []}
