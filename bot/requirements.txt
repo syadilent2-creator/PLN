@@ -5,3 +5,4 @@ gunicorn==22.0.0
 gspread==6.1.2
 google-auth==2.34.0
 Pillow==10.4.0
+google-api-python-client==2.143.0

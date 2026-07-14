@@ -25,6 +25,7 @@ import threading
 import base64
 import random
 import string
+from typing import Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -33,6 +34,8 @@ from dotenv import load_dotenv
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
@@ -45,6 +48,15 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1vXFzN8nktmBmHUzN9KqkpaIBhHUSmoaXCXQOMb2Q2MY")
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # isi mentah file JSON service account
+# Folder Google Drive (opsional) tempat menyimpan foto yang di-upload lewat reply chat.
+# Kalau kosong, file diupload ke root "My Drive" milik service account.
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")
+
+# Scope gabungan: Sheets (baca/tulis) + Drive (upload file, hanya file yang dibuat sendiri oleh bot)
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+]
 
 TZ = ZoneInfo("Asia/Jakarta")
 HARI_ID = ["SENIN", "SELASA", "RABU", "KAMIS", "JUM'AT", "SABTU", "MINGGU"]
@@ -62,6 +74,14 @@ app = Flask(__name__)
 
 # Cache lokasi terakhir per user, in-memory: { user_id: {"lat":.., "lon":.., "nama":.., "waktu": datetime} }
 LAST_LOCATION = {}
+
+# Cache untuk fitur "reply dengan foto -> masuk kolom Gambar":
+# - ROW_BY_MESSAGE: { message_id balasan ringkasan bot : nomor baris di sheet }
+#   Dipakai kalau user reply LANGSUNG ke pesan ringkasan laporan tsb dengan foto.
+# - LAST_ROW_BY_USER: { user_id : nomor baris terakhir yang ditulis }
+#   Fallback kalau user kirim foto tanpa reply spesifik (dianggap untuk laporan terakhirnya).
+ROW_BY_MESSAGE = {}
+LAST_ROW_BY_USER = {}
 
 KEGIATAN_LABEL = {
     "emergency": "EMERGENCY",
@@ -274,6 +294,17 @@ def telegram_webhook():
         threading.Thread(target=proses_location, args=(user_id, chat_id, loc)).start()
         return jsonify({"ok": True})
 
+    # --- Foto (biasanya sebagai reply ke ringkasan laporan): masuk ke kolom Gambar ---
+    if "photo" in msg:
+        # Telegram kirim beberapa resolusi, ambil yang paling besar (elemen terakhir)
+        file_id = msg["photo"][-1]["file_id"]
+        reply_to = msg.get("reply_to_message") or {}
+        reply_msg_id = reply_to.get("message_id")
+        threading.Thread(
+            target=proses_foto_laporan, args=(user_id, chat_id, file_id, reply_msg_id)
+        ).start()
+        return jsonify({"ok": True})
+
     # --- Voice note: proses transkrip + ekstraksi + tulis ke sheet ---
     if "voice" in msg:
         file_id = msg["voice"]["file_id"]
@@ -402,17 +433,23 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
     # Deskripsi selalu pakai teks lengkap apa adanya (bukan potongan hasil AI)
     data["deskripsi"] = teks
 
-    # 2. Tulis ke Google Sheet
-    now = datetime.now(TZ)
-    hari = HARI_ID[now.weekday()]
-    tanggal = now.strftime("%d-%m-%Y")
-    baris = tulis_ke_sheet(hari, tanggal, data)
-
-    # 3. Balas ringkasan ke user
+    # 2. Ambil lokasi terakhir user (dari share-location / Mini App) SEBELUM tulis ke sheet,
+    #    supaya kolom Lokasi langsung terisi nama daerah + titik koordinat.
     u_id = int(user_id) if str(user_id).isdigit() else user_id
     loc = LAST_LOCATION.get(u_id) or LAST_LOCATION.get(str(u_id))
     lokasi_teks = loc["nama"] if loc else "(belum ada lokasi)"
 
+    # 3. Tulis ke Google Sheet
+    now = datetime.now(TZ)
+    hari = HARI_ID[now.weekday()]
+    tanggal = now.strftime("%d-%m-%Y")
+    baris = tulis_ke_sheet(hari, tanggal, data, loc=loc)
+
+    # Simpan baris ini sebagai "laporan terakhir" user, dipakai kalau nanti user
+    # reply pesan ringkasan di bawah ini dengan foto -> foto masuk ke baris yang sama.
+    LAST_ROW_BY_USER[user_id] = baris
+
+    # 4. Balas ringkasan ke user
     material_teks = "\n".join(
         f"  \u2022 {m['nama']} - {m['jumlah']}" for m in data.get("material", [])
     ) or "  -"
@@ -425,21 +462,32 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
         f"Kegiatan: {data.get('kegiatan', '-')}\n"
         f"Deskripsi: {data.get('deskripsi', '-')}\n"
         f"Material:\n{material_teks}\n\n"
-        f"{sumber_teks}"
+        f"{sumber_teks}\n\n"
+        f"\U0001F4F7 _Balas (reply) pesan ini dengan foto kegiatan untuk mengisi kolom Gambar._"
     )
-    kirim_pesan(chat_id, balasan)
+    hasil_kirim = kirim_pesan(chat_id, balasan)
+
+    # Catat message_id balasan ini -> baris, supaya kalau user reply pesan ini dengan
+    # foto, kita tahu persis baris mana yang harus diisi kolom Gambar-nya.
+    try:
+        sent_message_id = hasil_kirim.json()["result"]["message_id"]
+        ROW_BY_MESSAGE[sent_message_id] = baris
+    except Exception:
+        logger.exception("Gagal mencatat message_id -> baris untuk fitur reply foto")
 
     # Kalau lokasi belum tercatat, langsung susulkan tombol share-location 1-tap
     if not loc:
         kirim_tombol_minta_lokasi(chat_id)
 
 
-def download_telegram_file(file_id: str) -> str:
+def download_telegram_file(file_id: str, suffix: str = ".oga") -> str:
     r = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=15)
     file_path = r.json()["result"]["file_path"]
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
 
-    fd, local_path = tempfile.mkstemp(suffix=".oga")
+    # Pakai ekstensi asli dari Telegram kalau ada, biar file foto/audio konsisten
+    ext = os.path.splitext(file_path)[1] or suffix
+    fd, local_path = tempfile.mkstemp(suffix=ext)
     os.close(fd)
     with requests.get(file_url, stream=True, timeout=30) as resp:
         with open(local_path, "wb") as f:
@@ -448,21 +496,115 @@ def download_telegram_file(file_id: str) -> str:
     return local_path
 
 
+# ======================================================================
+# 3. [BARU] FOTO SEBAGAI REPLY -> UPLOAD KE DRIVE -> TAMPIL DI KOLOM GAMBAR
+# ======================================================================
+
+def get_drive_service():
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=GOOGLE_SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def upload_foto_ke_drive(local_path: str, nama_file: str) -> str:
+    """Upload file lokal ke Google Drive (pakai service account yang sama dengan Sheets),
+    jadikan link-nya bisa diakses publik (anyone-with-link, read only), lalu kembalikan
+    URL gambar langsung yang bisa dibaca oleh formula IMAGE() di Google Sheets."""
+    service = get_drive_service()
+
+    metadata = {"name": nama_file}
+    if DRIVE_FOLDER_ID:
+        metadata["parents"] = [DRIVE_FOLDER_ID]
+
+    media = MediaFileUpload(local_path, mimetype="image/jpeg", resumable=False)
+    file = service.files().create(body=metadata, media_body=media, fields="id").execute()
+    file_id = file["id"]
+
+    # Buka akses baca untuk siapa saja yang punya link (supaya Google Sheets bisa fetch gambarnya)
+    service.permissions().create(
+        fileId=file_id, body={"role": "reader", "type": "anyone"}
+    ).execute()
+
+    # Format URL ini bisa langsung dibaca sebagai gambar oleh formula =IMAGE(...)
+    return f"https://drive.google.com/uc?export=view&id={file_id}"
+
+
+def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
+    """Handle foto yang dikirim user (biasanya sebagai reply ke ringkasan laporan).
+    Foto diupload ke Drive lalu disisipkan ke kolom Gambar (kolom I) pada baris yang sesuai,
+    memakai formula IMAGE(url, 1) supaya ukurannya otomatis menyesuaikan ukuran cell."""
+    local_path = None
+    try:
+        # Tentukan baris tujuan: prioritas baris dari pesan yang di-reply,
+        # fallback ke laporan terakhir user ini kalau reply tidak spesifik/tidak ada.
+        target_row = ROW_BY_MESSAGE.get(reply_msg_id) if reply_msg_id else None
+        if target_row is None:
+            target_row = LAST_ROW_BY_USER.get(user_id)
+
+        if target_row is None:
+            kirim_pesan(
+                chat_id,
+                "Belum ada laporan (teks/suara) untuk dikaitkan dengan foto ini. "
+                "Kirim laporan kegiatan dulu, baru reply pesan ringkasannya dengan foto.",
+            )
+            return
+
+        kirim_pesan(chat_id, f"Menerima foto, mengunggah ke baris {target_row}...")
+
+        local_path = download_telegram_file(file_id, suffix=".jpg")
+        nama_file = f"laporan_baris{target_row}_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.jpg"
+        url_gambar = upload_foto_ke_drive(local_path, nama_file)
+
+        ws = get_sheet()
+        ws.update(
+            f"I{target_row}:I{target_row}",
+            [[f'=IMAGE("{url_gambar}", 1)']],
+            value_input_option="USER_ENTERED",
+        )
+
+        kirim_pesan(chat_id, f"Foto tersimpan di kolom Gambar, baris {target_row}.")
+    except Exception as e:
+        logger.exception("Gagal proses foto laporan")
+        kirim_pesan(chat_id, f"Gagal mengunggah foto: {e}")
+    finally:
+        if local_path and os.path.exists(local_path):
+            os.remove(local_path)
+
+
 def ekstrak_laporan(teks: str) -> dict:
     """Minta Gemini mengubah transkrip bebas jadi field terstruktur."""
     kategori = ", ".join(KEGIATAN_LABEL.values())
-    prompt = f"""Kamu adalah asisten pencatatan laporan lapangan PLN. Tugasmu adalah mengekstrak teks laporan menjadi format JSON terstruktur berisi "kegiatan" dan "material" saja.
+    prompt = f"""Kamu adalah asisten pencatatan laporan lapangan PLN yang sangat teliti, selayaknya petugas admin manusia yang membaca laporan dari VN (voice note) maupun teks ketikan lalu memindahkannya ke tabel Excel/Spreadsheet. Tugasmu mengekstrak teks laporan menjadi JSON terstruktur berisi "kegiatan" dan "material" saja.
 
-Aturan Ekstraksi Laporan:
-1. Kalimat atau bagian pertama dari teks menjelaskan "kegiatan". Kamu WAJIB mencocokkan dan memilih salah satu dari kategori resmi berikut (tulis persis sama):
-   - EMERGENCY
-   - INSPEKSI GARDU
-   - PEMELIHARAAN
-   - ROW
-   - INSPEKSI JTM
-   Pilih yang paling sesuai.
+========================================
+ATURAN 1 - MENENTUKAN "kegiatan"
+========================================
+Baca keseluruhan konteks laporan (bukan cuma kata pertama), lalu cocokkan ke SALAH SATU dari 5 kategori resmi berikut (tulis persis sama, huruf besar semua):
 
-2. Kalimat atau bagian ketiga (atau bagian manapun yang menyebutkan barang/komponen) menjelaskan "material" yang digunakan beserta "jumlah" nya. Pisahkan dengan jelas antara nama material dan jumlahnya.
+- EMERGENCY
+  Ciri-ciri: gangguan mendadak/darurat, padam tiba-tiba, jaringan putus/roboh akibat pohon tumbang/longsor/kecelakaan, kebakaran, perbaikan darurat di luar jadwal rutin.
+
+- INSPEKSI GARDU
+  Ciri-ciri: mengecek/memeriksa/patroli kondisi GARDU DISTRIBUSI, trafo, PHPTR (Panel Hubung Bagi Tegangan Rendah), kubikel, box gardu. Kata kunci: "inspeksi gardu", "cek gardu", "cek trafo", "kondisi gardu".
+
+- PEMELIHARAAN
+  Ciri-ciri: kegiatan perawatan/pemeliharaan terjadwal (preventif), mengganti komponen yang aus/rusak secara rutin (bukan darurat), membersihkan, mengencangkan baut/klem, mengganti fuse/isolator/komponen sebagai bagian pemeliharaan berkala. Kata kunci: "pemeliharaan", "perawatan", "penggantian rutin".
+
+- ROW
+  Ciri-ciri: Right of Way — pemangkasan/penebangan pohon atau vegetasi yang mendekati/mengganggu jaringan listrik, pembersihan jalur/lintasan kabel. Kata kunci: "ROW", "pemangkasan pohon", "vegetasi", "penebangan".
+
+- INSPEKSI JTM
+  Ciri-ciri: mengecek/memeriksa/patroli kondisi JARINGAN TEGANGAN MENENGAH (JTM) di LUAR gardu — tiang listrik, kawat/konduktor, isolator di jaringan, andongan kawat. Kata kunci: "inspeksi JTM", "patroli jaringan", "cek tiang", "cek jaringan".
+
+Jika laporan menyebut kombinasi (misal inspeksi SEKALIGUS ganti komponen), pilih kategori berdasarkan TUJUAN UTAMA kunjungan (inspeksi rutin gardu yang berujung ganti komponen kecil tetap INSPEKSI GARDU; sedangkan penggantian terjadwal skala pemeliharaan masuk PEMELIHARAAN).
+
+========================================
+ATURAN 2 - MENENTUKAN "material" dan "jumlah"
+========================================
+Seperti manusia yang membaca laporan, kenali material & jumlahnya dari KATA KUNCI berikut yang biasa muncul di VN maupun teks ketikan (tidak harus selalu di kalimat ketiga, bisa di mana saja):
+  - Kata kerja penanda material dipakai: "ganti"/"mengganti"/"penggantian", "pasang"/"memasang"/"pemasangan", "gunakan"/"menggunakan", "tambah"/"menambahkan".
+  - Kata penanda jumlah: "sebanyak", "jumlah", angka + satuan langsung setelah nama barang (contoh: "isolator 3 buah", "fuse 2 pcs", "kabel 5 meter").
+Ambil PASANGAN nama barang + jumlah + satuannya secara utuh. Jika ada beberapa material dalam satu laporan, masukkan semua sebagai item terpisah dalam array "material". Jika jumlah tidak disebutkan eksplisit, isi jumlah dengan "-".
 
 Contoh Ekstraksi:
 Teks: "Inspeksi gardu, cek kondisi trafo aman, ganti isolator 3 buah"
@@ -474,6 +616,16 @@ Output JSON:
       "nama": "isolator",
       "jumlah": "3 buah"
     }}
+  ]
+}}
+
+Teks: "Melakukan pemeliharaan pada PHPTR dengan mengganti NH fuse sebanyak 3 buah dan menggunakan kabel schoen 2 pcs"
+Output JSON:
+{{
+  "kegiatan": "PEMELIHARAAN",
+  "material": [
+    {{"nama": "NH fuse", "jumlah": "3 buah"}},
+    {{"nama": "kabel schoen", "jumlah": "2 pcs"}}
   ]
 }}
 
@@ -537,16 +689,25 @@ Jika tidak ada material yang digunakan, isi "material": []."""
 
 def get_sheet():
     creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    creds = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
+    creds = Credentials.from_service_account_info(creds_dict, scopes=GOOGLE_SCOPES)
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SPREADSHEET_ID)
     return sh.worksheet(SHEET_NAME)
 
 
-def tulis_ke_sheet(hari: str, tanggal: str, data: dict) -> int:
+def format_lokasi(loc: Optional[dict]) -> str:
+    """Gabungkan nama daerah + titik koordinat jadi satu teks untuk kolom Lokasi.
+    Contoh: 'Jl. Ahmad Yani, Kec. Sawahan, Surabaya (-7.290000, 112.730000)'"""
+    if not loc:
+        return ""
+    nama = loc.get("nama") or "Lokasi tidak diketahui"
+    lat, lon = loc.get("lat"), loc.get("lon")
+    if lat is None or lon is None:
+        return nama
+    return f"{nama} ({lat}, {lon})"
+
+
+def tulis_ke_sheet(hari: str, tanggal: str, data: dict, loc: Optional[dict] = None) -> int:
     """Cari baris pertama yang kolom Deskripsi (E) masih kosong, isi di situ.
     Kembalikan nomor baris yang ditulis."""
     ws = get_sheet()
@@ -574,10 +735,12 @@ def tulis_ke_sheet(hari: str, tanggal: str, data: dict) -> int:
     material_list = data.get("material", [])
     material_val = "\n".join(m.get("nama", "") for m in material_list)
     jumlah_val = "\n".join(m.get("jumlah", "") for m in material_list)
+    lokasi_val = cell(7) or format_lokasi(loc)
 
     ws.update(
-        f"A{target_row}:G{target_row}",
-        [[no_val, hari_val, tanggal_val, kegiatan_val, data.get("deskripsi", ""), material_val, jumlah_val]],
+        f"A{target_row}:H{target_row}",
+        [[no_val, hari_val, tanggal_val, kegiatan_val, data.get("deskripsi", ""),
+          material_val, jumlah_val, lokasi_val]],
     )
     return target_row
 
@@ -586,7 +749,7 @@ def kirim_pesan(chat_id, teks: str, reply_markup: dict = None):
     payload = {"chat_id": chat_id, "text": teks, "parse_mode": "Markdown"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
-    requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=15)
+    return requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=15)
 
 
 def kirim_tombol_minta_lokasi(chat_id):

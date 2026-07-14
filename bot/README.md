@@ -57,6 +57,20 @@ Sekarang tombol menu (ikon di sebelah kolom chat, seperti "View Menu" di gambar 
 ### 5. Uji coba
 Buka bot di Telegram → tekan tombol menu → izinkan akses kamera & lokasi → ambil foto kegiatan → cek folder `foto/{kegiatan}/{tanggal}/` di server, dan cek chat Telegram menerima foto baliknya.
 
+## Fitur baru: Lokasi otomatis & Foto via reply
+
+Sheet punya 9 kolom: `No, Hari, Tanggal, Kegiatan, Deskripsi, Material, Jumlah, Lokasi, Gambar`.
+
+1. **Kegiatan** — teks laporan (VN atau ketik) dicocokkan otomatis oleh AI ke salah satu dari 5 kategori resmi (EMERGENCY, INSPEKSI GARDU, PEMELIHARAAN, ROW, INSPEKSI JTM) berdasarkan konteks, bukan cuma kata pertama.
+2. **Material & Jumlah** — dikenali dari kata kunci seperti "mengganti", "menggunakan", "sebanyak", "jumlah", atau pola "nama barang + angka + satuan".
+3. **Lokasi** — otomatis terisi dari lokasi terakhir yang di-share user (tombol 📍 Bagikan Lokasi, atau dari Mini App kamera), berupa `nama daerah (lat, lon)`.
+4. **Gambar** — setelah bot membalas ringkasan laporan, **reply pesan ringkasan itu dengan foto**. Foto akan diupload ke Google Drive (pakai service account yang sama) lalu disisipkan ke kolom Gambar di baris yang sama memakai formula `=IMAGE(url, 1)`, sehingga foto otomatis menyesuaikan ukuran cell. Kalau user kirim foto tanpa reply spesifik, foto tetap masuk ke baris laporan terakhir user tsb.
+
+### Setup tambahan untuk fitur foto
+1. Di Google Cloud Console (project yang sama dengan service account), **aktifkan Google Drive API** (selain Sheets API yang sudah aktif).
+2. Service account otomatis bisa upload ke foldernya sendiri. Kalau mau foto masuk ke folder Drive tertentu (misal folder yang sudah kamu share ke tim), buat folder di Drive, share ke email service account (role Editor), lalu isi env var `DRIVE_FOLDER_ID` dengan ID folder tsb.
+3. Tidak perlu ubah izin sheet — service account yang sudah edit access ke spreadsheet otomatis bisa menulis formula gambar.
+
 ## Yang perlu disesuaikan lagi
 - **Reverse geocoding**: contoh pakai Nominatim (gratis, ada rate limit). Untuk pemakaian production/banyak user, ganti ke Google Maps Geocoding API (berbayar tapi lebih stabil & akurat).
 - **Daftar kegiatan**: edit array `KEGIATAN_LIST` di `index.html` dan `KEGIATAN_LABEL` di `bot.py` sesuai jenis kegiatan lapangan PLN yang kamu perlukan.
