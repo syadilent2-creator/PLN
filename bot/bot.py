@@ -2,24 +2,35 @@
 Backend Bot Telegram untuk Dokumentasi Kegiatan PLN
 ======================================================
 Fungsi:
-1. Menerima upload foto dari Mini App (multipart/form-data)
-2. Menyimpan foto ke folder lokal: foto/{kegiatan}/{tanggal}/
-3. Mengirim balik foto tersebut ke chat Telegram user
-   (agar user bisa "Save to gallery" & forward ke WhatsApp langsung dari Telegram)
+1. Menerima upload foto dari Mini App (multipart/form-data) -> endpoint /upload
+2. [BARU] Menerima pesan suara (voice note) langsung di chat -> endpoint /telegram-webhook
+   - Transkrip suara jadi teks (OpenAI Whisper)
+   - Ekstrak kegiatan, deskripsi, material & jumlah (OpenAI GPT, JSON mode)
+   - Cari baris kosong di Google Sheet, isi otomatis
+   - Balas ke user dengan ringkasan (Hari, Tanggal, Lokasi, Kegiatan, Deskripsi, Material)
+3. [BARU] Menerima share-location -> dipakai sebagai "lokasi terakhir" untuk laporan VN berikutnya
 
 Install dependencies:
-    pip install flask python-telegram-bot python-dotenv
+    pip install -r requirements.txt
 
 Jalankan:
     python bot.py
 """
 
 import os
+import json
 import logging
+import tempfile
+import threading
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import requests
+from openai import OpenAI
+import gspread
+from google.oauth2.service_account import Credentials
 
 load_dotenv()
 
@@ -27,10 +38,23 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "GANTI_DENGAN_TOKEN_BOTMU")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BASE_FOTO_DIR = "foto"
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1vXFzN8nktmBmHUzN9KqkpaIBhHUSmoaXCXQOMb2Q2MY")
+SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # isi mentah file JSON service account
+
+TZ = ZoneInfo("Asia/Jakarta")
+HARI_ID = ["SENIN", "SELASA", "RABU", "KAMIS", "JUM'AT", "SABTU", "MINGGU"]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Cache lokasi terakhir per user, in-memory: { user_id: {"lat":.., "lon":.., "nama":.., "waktu": datetime} }
+LAST_LOCATION = {}
 
 KEGIATAN_LABEL = {
     "inspeksi": "Inspeksi",
@@ -42,6 +66,10 @@ KEGIATAN_LABEL = {
     "temuan": "Temuan",
 }
 
+
+# ======================================================================
+# 1. UPLOAD FOTO DARI MINI APP (fitur lama, tidak berubah)
+# ======================================================================
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -61,18 +89,16 @@ def upload():
         if not user_id:
             return jsonify({"status": "error", "message": "user_id tidak ditemukan"}), 400
 
-        now = datetime.now()
+        now = datetime.now(TZ)
         tanggal_folder = now.strftime("%Y-%m-%d")
         waktu_file = now.strftime("%H%M%S")
 
-        # 1. Simpan ke folder lokal berdasarkan kegiatan & tanggal
         folder = os.path.join(BASE_FOTO_DIR, kegiatan, tanggal_folder)
         os.makedirs(folder, exist_ok=True)
         filepath = os.path.join(folder, f"{waktu_file}_{user_id}.jpg")
         photo.save(filepath)
         logger.info(f"Foto disimpan: {filepath}")
 
-        # 2. Kirim balik foto ke chat Telegram user
         label = KEGIATAN_LABEL.get(kegiatan, kegiatan)
         alamat = ", ".join(filter(None, [jalan, kelurahan]))
         wilayah = ", ".join(filter(None, [f"Kec. {kecamatan}" if kecamatan else "", kota]))
@@ -93,7 +119,6 @@ def upload():
 
 
 def kirim_foto_ke_telegram(chat_id: str, filepath: str, caption: str):
-    """Kirim foto ke chat user via Telegram Bot API."""
     with open(filepath, "rb") as f:
         resp = requests.post(
             f"{TELEGRAM_API}/sendPhoto",
@@ -105,11 +130,259 @@ def kirim_foto_ke_telegram(chat_id: str, filepath: str, caption: str):
         logger.error(f"Gagal kirim ke Telegram: {resp.text}")
 
 
+# ======================================================================
+# 2. [BARU] WEBHOOK TELEGRAM - tangkap voice note & share-location
+# ======================================================================
+
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    """Telegram akan POST setiap update (pesan baru) ke sini."""
+    update = request.get_json(silent=True) or {}
+    msg = update.get("message")
+
+    if not msg:
+        return jsonify({"ok": True})  # abaikan update jenis lain
+
+    chat_id = msg["chat"]["id"]
+    user_id = msg["from"]["id"]
+
+    # --- Share-location: simpan sebagai lokasi terakhir user ini ---
+    if "location" in msg:
+        loc = msg["location"]
+        threading.Thread(target=proses_location, args=(user_id, chat_id, loc)).start()
+        return jsonify({"ok": True})
+
+    # --- Voice note: proses transkrip + ekstraksi + tulis ke sheet ---
+    if "voice" in msg:
+        file_id = msg["voice"]["file_id"]
+        # Balas cepat dulu biar Telegram tidak timeout/retry,
+        # proses berat dikerjakan di background thread.
+        kirim_pesan(chat_id, "Menerima laporan suara, sedang diproses...")
+        threading.Thread(target=proses_voice_note, args=(user_id, chat_id, file_id)).start()
+        return jsonify({"ok": True})
+
+    # --- Teks biasa (bukan command): anggap laporan yang diketik manual ---
+    if "text" in msg:
+        teks = msg["text"].strip()
+        if teks.startswith("/"):
+            if teks == "/start":
+                kirim_pesan(
+                    chat_id,
+                    "Halo! Kirim *pesan suara* ATAU *ketik teks* untuk mencatat laporan kegiatan.\n\n"
+                    "Contoh ketik: \"Inspeksi gardu, cek kondisi trafo aman, "
+                    "ganti isolator 3 buah\"\n\n"
+                    "Sebelum mulai (sekali per shift), share lokasi kamu lewat "
+                    "\U0001F4CE > Location, supaya laporan mencantumkan lokasi kerja."
+                )
+            return jsonify({"ok": True})
+
+        kirim_pesan(chat_id, "Menerima laporan teks, sedang diproses...")
+        threading.Thread(target=proses_laporan_teks, args=(user_id, chat_id, teks)).start()
+        return jsonify({"ok": True})
+
+    return jsonify({"ok": True})
+
+
+def proses_location(user_id, chat_id, loc):
+    lat, lon = loc["latitude"], loc["longitude"]
+    nama = "Lokasi tidak diketahui"
+    try:
+        res = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": lat, "lon": lon, "format": "json", "accept-language": "id", "zoom": 18},
+            headers={"User-Agent": "pln-rpa-bot"},
+            timeout=10,
+        )
+        addr = res.json().get("address", {})
+        bagian = [
+            addr.get("road") or addr.get("pedestrian"),
+            addr.get("village") or addr.get("suburb"),
+            f"Kec. {addr.get('city_district')}" if addr.get("city_district") else None,
+            addr.get("city") or addr.get("county"),
+        ]
+        nama = ", ".join(filter(None, bagian)) or nama
+    except Exception:
+        logger.exception("Gagal reverse geocode lokasi")
+
+    LAST_LOCATION[user_id] = {"lat": lat, "lon": lon, "nama": nama, "waktu": datetime.now(TZ)}
+    kirim_pesan(chat_id, f"Lokasi tersimpan: {nama}\nAkan dipakai untuk laporan suara berikutnya.")
+
+
+def proses_voice_note(user_id, chat_id, file_id):
+    try:
+        if not openai_client:
+            kirim_pesan(chat_id, "OPENAI_API_KEY belum diset di server. Hubungi admin bot.")
+            return
+
+        # 1. Download file voice dari Telegram
+        audio_path = download_telegram_file(file_id)
+
+        # 2. Transkrip suara -> teks (Whisper)
+        with open(audio_path, "rb") as f:
+            transcript = openai_client.audio.transcriptions.create(
+                model="whisper-1", file=f, language="id"
+            )
+        teks = transcript.text.strip()
+        os.remove(audio_path)
+
+        if not teks:
+            kirim_pesan(chat_id, "Maaf, suara tidak bisa dikenali. Coba rekam ulang lebih jelas.")
+            return
+
+        proses_dan_simpan_laporan(user_id, chat_id, teks, sumber="suara")
+
+    except Exception as e:
+        logger.exception("Gagal proses voice note")
+        kirim_pesan(chat_id, f"Gagal memproses laporan: {e}")
+
+
+def proses_laporan_teks(user_id, chat_id, teks):
+    try:
+        if not openai_client:
+            kirim_pesan(chat_id, "OPENAI_API_KEY belum diset di server. Hubungi admin bot.")
+            return
+        proses_dan_simpan_laporan(user_id, chat_id, teks, sumber="teks")
+    except Exception as e:
+        logger.exception("Gagal proses laporan teks")
+        kirim_pesan(chat_id, f"Gagal memproses laporan: {e}")
+
+
+def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
+    """Inti bersama: ekstraksi AI -> tulis ke sheet -> balas ke user.
+    Dipakai baik untuk laporan dari voice note maupun teks ketikan."""
+
+    # 1. Ekstraksi terstruktur -> JSON (GPT)
+    data = ekstrak_laporan(teks)
+
+    # 2. Tulis ke Google Sheet
+    now = datetime.now(TZ)
+    hari = HARI_ID[now.weekday()]
+    tanggal = now.strftime("%d-%m-%Y")
+    baris = tulis_ke_sheet(hari, tanggal, data)
+
+    # 3. Balas ringkasan ke user
+    loc = LAST_LOCATION.get(user_id)
+    lokasi_teks = loc["nama"] if loc else "(belum ada lokasi, share lokasi dulu)"
+
+    material_teks = "\n".join(
+        f"  \u2022 {m['nama']} - {m['jumlah']}" for m in data.get("material", [])
+    ) or "  -"
+
+    sumber_teks = "_Dari pesan suara_" if sumber == "suara" else "_Dari teks ketikan_"
+    balasan = (
+        f"*Laporan tersimpan* (baris {baris})\n\n"
+        f"Hari/Tanggal: {hari}, {tanggal}\n"
+        f"Lokasi: {lokasi_teks}\n"
+        f"Kegiatan: {data.get('kegiatan', '-')}\n"
+        f"Deskripsi: {data.get('deskripsi', '-')}\n"
+        f"Material:\n{material_teks}\n\n"
+        f"{sumber_teks}"
+    )
+    kirim_pesan(chat_id, balasan)
+
+
+def download_telegram_file(file_id: str) -> str:
+    r = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=15)
+    file_path = r.json()["result"]["file_path"]
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+
+    fd, local_path = tempfile.mkstemp(suffix=".oga")
+    os.close(fd)
+    with requests.get(file_url, stream=True, timeout=30) as resp:
+        with open(local_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+    return local_path
+
+
+def ekstrak_laporan(teks: str) -> dict:
+    """Minta GPT mengubah transkrip bebas jadi field terstruktur."""
+    kategori = ", ".join(KEGIATAN_LABEL.values())
+    prompt = f"""Kamu membantu mencatat laporan kerja lapangan PLN dari transkrip suara petugas.
+Kategori kegiatan yang umum dipakai: {kategori}. Kalau tidak cocok satupun, pakai kategori yang paling mendekati atau tulis apa adanya.
+
+Transkrip: \"\"\"{teks}\"\"\"
+
+Balas HANYA dengan JSON valid, tanpa teks lain, format persis:
+{{
+  "kegiatan": "nama kegiatan singkat",
+  "deskripsi": "ringkasan deskripsi kegiatan, 1-2 kalimat, bahasa Indonesia rapi",
+  "material": [ {{"nama": "nama material", "jumlah": "jumlah + satuan, contoh: 5 buah"}} ]
+}}
+Kalau tidak ada material disebutkan, kembalikan "material": []."""
+
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+    try:
+        return json.loads(resp.choices[0].message.content)
+    except Exception:
+        logger.exception("Gagal parse JSON dari GPT")
+        return {"kegiatan": "", "deskripsi": teks, "material": []}
+
+
+def get_sheet():
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    return sh.worksheet(SHEET_NAME)
+
+
+def tulis_ke_sheet(hari: str, tanggal: str, data: dict) -> int:
+    """Cari baris pertama yang kolom Deskripsi (E) masih kosong, isi di situ.
+    Kembalikan nomor baris yang ditulis."""
+    ws = get_sheet()
+    semua = ws.get_all_values()  # termasuk header di baris 1
+
+    target_row = None
+    for i, row in enumerate(semua[1:], start=2):  # mulai dari baris 2
+        deskripsi_cell = row[4] if len(row) > 4 else ""
+        if not deskripsi_cell.strip():
+            target_row = i
+            break
+    if target_row is None:
+        target_row = len(semua) + 1  # kalau semua penuh, tambah baris baru di akhir
+
+    existing = semua[target_row - 1] if target_row - 1 < len(semua) else []
+
+    def cell(idx):
+        return existing[idx].strip() if idx < len(existing) else ""
+
+    no_val = cell(0) or str(target_row - 1)
+    hari_val = cell(1) or hari
+    tanggal_val = cell(2) or tanggal
+    kegiatan_val = cell(3) or data.get("kegiatan", "")
+
+    material_list = data.get("material", [])
+    material_val = "\n".join(m.get("nama", "") for m in material_list)
+    jumlah_val = "\n".join(m.get("jumlah", "") for m in material_list)
+
+    ws.update(
+        f"A{target_row}:G{target_row}",
+        [[no_val, hari_val, tanggal_val, kegiatan_val, data.get("deskripsi", ""), material_val, jumlah_val]],
+    )
+    return target_row
+
+
+def kirim_pesan(chat_id, teks: str):
+    requests.post(
+        f"{TELEGRAM_API}/sendMessage",
+        json={"chat_id": chat_id, "text": teks, "parse_mode": "Markdown"},
+        timeout=15,
+    )
+
+
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "running"})
 
 
 if __name__ == "__main__":
-    # Untuk production, gunakan gunicorn/uwsgi + reverse proxy HTTPS (nginx / Caddy)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
