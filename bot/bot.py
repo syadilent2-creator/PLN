@@ -320,40 +320,118 @@ def deteksi_kegiatan_dari_kata_kunci(teks: str) -> Optional[str]:
 
 
 # ======================================================================
-# PENCOCOKAN MATERIAL & JUMLAH BERDASARKAN POLA KATA (regex, deterministik)
+# PENCOCOKAN MATERIAL & JUMLAH BERDASARKAN POLA KATA (heuristik, deterministik)
 # ======================================================================
-# Pola: <kata kerja pemakaian/penggantian> <nama barang> [sebanyak] <angka> [satuan]
-# Contoh yang tertangkap: "ganti isolator 3 buah", "menggunakan kabel schoen sebanyak 2 pcs"
-_KATA_KERJA_MATERIAL = (
-    r"(?:mengganti|penggantian|ganti|memasang|pemasangan|pasang|"
-    r"menggunakan|gunakan|menambahkan|tambah)"
-)
-_SATUAN = (
-    r"(?:buah|pcs|pc|unit|meter|mtr|m|set|batang|btg|roll|lembar|butir|liter|ltr|box)"
-)
-MATERIAL_REGEX = re.compile(
-    rf"{_KATA_KERJA_MATERIAL}\s+([a-zA-Z0-9\-\s]{{2,40}}?)\s+(?:sebanyak\s+)?(\d+(?:[.,]\d+)?)\s*({_SATUAN})?",
-    re.IGNORECASE,
-)
+# Seperti manusia yang membaca laporan: setelah nemu kata kerja pemakaian/penggantian,
+# cari angkanya (baik ditulis digit "3" maupun kata "tiga"), lalu ambil nama barang
+# di SEBELUM atau SESUDAH angka itu tergantung urutan kalimatnya -- karena orang bicara
+# bebas, bisa "ganti isolator 3 buah" ATAU "mengganti tiga NH fuse yang rusak".
+_KATA_KERJA_MATERIAL_SET = {
+    "mengganti", "penggantian", "ganti", "memasang", "pemasangan", "pasang",
+    "menggunakan", "gunakan", "menambahkan", "tambah",
+}
+_SATUAN_SET = {
+    "buah", "pcs", "pc", "unit", "meter", "mtr", "m", "set", "batang", "btg",
+    "roll", "lembar", "butir", "liter", "ltr", "box",
+}
+# Kata yang menandai "berhenti di sini" saat mencari nama barang (biasanya masuk ke
+# info lain: lokasi, alasan, dsb) supaya nama barang tidak "kebablasan" ikut ke situ.
+_STOPWORD_BATAS = {
+    "di", "ke", "pada", "untuk", "karena", "dan", "serta", "akibat",
+    "sehingga", "agar", "supaya", "dari", "oleh", "dengan", "saat", "ketika",
+}
+# Kata pengisi yang dilewati (bukan bagian nama barang ataupun batas)
+_FILLER = {"sebanyak", "yang", "tersebut", "nya", "itu", "ini"}
+# Kata kondisi yang sering nempel SETELAH nama barang, bukan bagian nama barang itu sendiri
+_KONDISI = {
+    "rusak", "aus", "bermasalah", "hilang", "hangus", "pecah", "retak",
+    "bocor", "putus", "terbakar",
+}
+ANGKA_KATA = {
+    "satu": "1", "dua": "2", "tiga": "3", "empat": "4", "lima": "5",
+    "enam": "6", "tujuh": "7", "delapan": "8", "sembilan": "9", "sepuluh": "10",
+}
+_POLA_ANGKA_KATA = re.compile(r"\b(" + "|".join(ANGKA_KATA.keys()) + r")\b", re.IGNORECASE)
+
+
+def _normalisasi_angka_kata(teks: str) -> str:
+    """Ubah angka dalam bentuk kata ("tiga") jadi digit ("3") supaya bisa dideteksi,
+    karena hasil transkrip suara sering menulis angka sebagai kata, bukan digit."""
+    return _POLA_ANGKA_KATA.sub(lambda m: ANGKA_KATA[m.group(0).lower()], teks)
 
 
 def deteksi_material_regex(teks: str) -> list:
-    """Cari pasangan (nama material, jumlah) langsung dari kata kerja pemakaian/
-    penggantian + angka yang mengikutinya. Deterministik, tidak bergantung ke AI."""
+    """Cari pasangan (nama material, jumlah) dari kata kerja pemakaian/penggantian +
+    angka (digit maupun kata bilangan) yang menyertainya, di urutan manapun kalimat
+    itu ditulis. Deterministik, tidak bergantung ke AI."""
+    teks_norm = _normalisasi_angka_kata(teks)
+    kata_list = re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", teks_norm)
+    n = len(kata_list)
     hasil = []
     seen = set()
-    for m in MATERIAL_REGEX.finditer(teks):
-        nama = m.group(1).strip(" ,.-")
-        angka = m.group(2).strip()
-        satuan = (m.group(3) or "").strip()
-        if not nama:
+
+    i = 0
+    while i < n:
+        if kata_list[i].lower() not in _KATA_KERJA_MATERIAL_SET:
+            i += 1
             continue
-        key = nama.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        jumlah = f"{angka} {satuan}".strip() if satuan else angka
-        hasil.append({"nama": nama, "jumlah": jumlah})
+
+        batas = min(i + 9, n)  # jangkauan pencarian angka dibatasi ~8 kata setelah kata kerja
+        j = i + 1
+        while j < batas and kata_list[j].lower() not in _KATA_KERJA_MATERIAL_SET:
+            if not kata_list[j].isdigit():
+                j += 1
+                continue
+
+            idx_angka = j
+            satuan = ""
+            idx_setelah = j + 1
+            if idx_setelah < n and kata_list[idx_setelah].lower() in _SATUAN_SET:
+                satuan = kata_list[idx_setelah].lower()
+                idx_setelah += 1
+
+            # Coba cari nama barang SEBELUM angka dulu (pola: "ganti isolator 3 buah")
+            nama_kata = []
+            k = idx_angka - 1
+            while k > i and len(nama_kata) < 4:
+                w = kata_list[k]
+                wl = w.lower()
+                if wl in _STOPWORD_BATAS:
+                    break
+                if wl in _FILLER:
+                    k -= 1
+                    continue
+                nama_kata.insert(0, w)
+                k -= 1
+            nama = " ".join(nama_kata).strip()
+
+            # Kalau tidak ketemu (angka nempel langsung ke kata kerja), cari SETELAH
+            # angka/satuan (pola: "mengganti tiga NH fuse yang rusak")
+            if not nama:
+                nama_kata = []
+                k2 = idx_setelah
+                while k2 < batas and len(nama_kata) < 4:
+                    w = kata_list[k2]
+                    wl = w.lower()
+                    if wl in _STOPWORD_BATAS or wl in _KATA_KERJA_MATERIAL_SET:
+                        break
+                    if wl in _FILLER or wl in _KONDISI:
+                        k2 += 1
+                        continue
+                    nama_kata.append(w)
+                    k2 += 1
+                nama = " ".join(nama_kata).strip()
+
+            if nama:
+                key = nama.lower()
+                if key not in seen:
+                    seen.add(key)
+                    jumlah = f"{kata_list[idx_angka]} {satuan}".strip() if satuan else kata_list[idx_angka]
+                    hasil.append({"nama": nama, "jumlah": jumlah})
+            break  # 1 angka per kata kerja sudah cukup, lanjut cari kata kerja berikutnya
+
+        i += 1
+
     return hasil
 
 # --- Label tombol keyboard persisten (share lokasi + mulai kegiatan baru) ---
