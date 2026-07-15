@@ -475,15 +475,6 @@ def main_keyboard() -> dict:
     }
 
 # ======================================================================
-@app.route("/test-gemini", methods=["GET"])
-def test_gemini():
-    try:
-        payload = {"contents": [{"parts": [{"text": "Test: balas dengan kata 'OK'"}]}]}
-        res = panggil_gemini(payload)
-        return jsonify({"status": "ok", "text": res.json()})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-# ======================================================================
 
 # ======================================================================
 # 1. UPLOAD FOTO DARI MINI APP (fitur lama, tidak berubah)
