@@ -140,6 +140,7 @@ KEGIATAN_LABEL = {
     "pemeliharaan": "PEMELIHARAAN",
     "row": "ROW",
     "inspeksi_jtm": "INSPEKSI JTM",
+    "perbaikan": "PERBAIKAN",
 }
 
 # ======================================================================
@@ -198,18 +199,26 @@ KEGIATAN_KEYWORDS = {
         "primer": ["pemeliharaan", "perawatan", "maintenance"],
         "sekunder": [
             "preventif", "penggantian rutin", "pembersihan", "bersihkan",
-            "mengencangkan", "kencangkan baut", "perbaikan rutin",
+            "mengencangkan", "kencangkan baut",
         ],
+    },
+    "PERBAIKAN": {
+        "primer": [
+            "perbaikan", "memperbaiki", "diperbaiki", "reparasi", "perbaiki",
+        ],
+        "sekunder": ["servis", "betulkan"],
     },
 }
 BOBOT_PRIMER = 3
 BOBOT_SEKUNDER = 1
 # Urutan prioritas kalau ada skor kata kunci yang seri (kategori lebih spesifik menang)
-KEGIATAN_PRIORITY = ["EMERGENCY", "ROW", "INSPEKSI GARDU", "INSPEKSI JTM", "PEMELIHARAAN"]
+KEGIATAN_PRIORITY = [
+    "EMERGENCY", "ROW", "PERBAIKAN", "INSPEKSI GARDU", "INSPEKSI JTM", "PEMELIHARAAN",
+]
 
 
 def deteksi_kegiatan_dari_kata_kunci(teks: str) -> Optional[str]:
-    """Cocokkan teks laporan ke salah satu dari 5 kategori resmi berdasarkan
+    """Cocokkan teks laporan ke salah satu dari 6 kategori resmi berdasarkan
     kata/kalimat yang benar-benar muncul di deskripsi (bukan tebakan bebas AI).
     Return None kalau tidak ada kata kunci yang cocok sama sekali."""
     teks_lower = teks.lower()
@@ -530,11 +539,32 @@ def telegram_webhook():
                     "Contoh ketik: \"Inspeksi gardu, cek kondisi trafo aman, "
                     "ganti isolator 3 buah\"\n\n"
                     "Sebelum mulai (sekali per shift), tap tombol \U0001F4CD di bawah untuk "
-                    "membagikan lokasi kerja kamu, supaya laporan otomatis mencantumkan lokasi.\n\n"
+                    "membagikan lokasi kerja kamu, supaya laporan otomatis mencantumkan lokasi. "
+                    "Kalau tombol itu tidak bereaksi (kadang terjadi di Telegram Web/browser), "
+                    "ketik manual: `/lokasi nama tempat kamu`\n\n"
                     "Kalau mau memulai catatan kegiatan yang baru kapan saja, tap tombol "
                     "\U0001F504 Mulai Kegiatan Baru.",
                     reply_markup=main_keyboard(),
                 )
+            elif teks.startswith("/lokasi"):
+                nama_lokasi = teks[len("/lokasi"):].strip()
+                if not nama_lokasi:
+                    kirim_pesan(
+                        chat_id,
+                        "Format: `/lokasi nama tempat kamu`\n"
+                        "Contoh: `/lokasi Gardu Induk Rungkut, Surabaya`",
+                    )
+                else:
+                    LAST_LOCATION[user_id] = {
+                        "lat": None, "lon": None, "nama": nama_lokasi,
+                        "waktu": datetime.now(TZ),
+                    }
+                    kirim_pesan(
+                        chat_id,
+                        f"Lokasi tersimpan (manual): {nama_lokasi}\n"
+                        "Akan dipakai otomatis untuk laporan-laporan berikutnya.",
+                        reply_markup=main_keyboard(),
+                    )
             return jsonify({"ok": True})
 
         kirim_pesan(chat_id, "Menerima laporan teks, sedang diproses...")
@@ -654,7 +684,9 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
     now = datetime.now(TZ)
     hari = HARI_ID[now.weekday()]
     tanggal = now.strftime("%d-%m-%Y")
-    baris = tulis_ke_sheet(hari, tanggal, data, loc=loc)
+    waktu = now.strftime("%H:%M")
+    tanggal_waktu = f"{tanggal} {waktu}"  # kolom C sheet sekarang "Tanggal & Waktu" digabung
+    baris = tulis_ke_sheet(hari, tanggal_waktu, data, loc=loc)
 
     # Simpan baris ini sebagai "laporan terakhir" user, dipakai kalau nanti user
     # reply pesan ringkasan di bawah ini dengan foto -> foto masuk ke baris yang sama.
@@ -669,6 +701,7 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
     balasan = (
         f"*Laporan tersimpan* (baris {baris})\n\n"
         f"Hari/Tanggal: {hari}, {tanggal}\n"
+        f"Jam: {waktu} WIB\n"
         f"Lokasi: {lokasi_teks}\n"
         f"Kegiatan: {data.get('kegiatan', '-')}\n"
         f"Deskripsi: {data.get('deskripsi', '-')}\n"
@@ -857,16 +890,16 @@ def ekstrak_laporan(teks: str) -> dict:
 ========================================
 ATURAN 1 - MENENTUKAN "kegiatan"
 ========================================
-Baca keseluruhan konteks laporan (bukan cuma kata pertama), lalu cocokkan ke SALAH SATU dari 5 kategori resmi berikut (tulis persis sama, huruf besar semua):
+Baca keseluruhan konteks laporan (bukan cuma kata pertama), lalu cocokkan ke SALAH SATU dari 6 kategori resmi berikut (tulis persis sama, huruf besar semua):
 
 - EMERGENCY
-  Ciri-ciri: gangguan mendadak/darurat, padam tiba-tiba, jaringan putus/roboh akibat pohon tumbang/longsor/kecelakaan, kebakaran, perbaikan darurat di luar jadwal rutin.
+  Ciri-ciri: gangguan mendadak/darurat, padam tiba-tiba, jaringan putus/roboh akibat pohon tumbang/longsor/kecelakaan, kebakaran, kondisi berbahaya yang perlu ditangani segera di luar jadwal rutin.
 
 - INSPEKSI GARDU
   Ciri-ciri: mengecek/memeriksa/patroli kondisi GARDU DISTRIBUSI, trafo, PHPTR (Panel Hubung Bagi Tegangan Rendah), kubikel, box gardu. Kata kunci: "inspeksi gardu", "cek gardu", "cek trafo", "kondisi gardu".
 
 - PEMELIHARAAN
-  Ciri-ciri: kegiatan perawatan/pemeliharaan terjadwal (preventif), mengganti komponen yang aus/rusak secara rutin (bukan darurat), membersihkan, mengencangkan baut/klem, mengganti fuse/isolator/komponen sebagai bagian pemeliharaan berkala. Kata kunci: "pemeliharaan", "perawatan", "penggantian rutin".
+  Ciri-ciri: kegiatan perawatan/pemeliharaan TERJADWAL (preventif) yang memang sudah direncanakan rutin, membersihkan, mengencangkan baut/klem, penggantian komponen sebagai bagian pemeliharaan berkala. Kata kunci: "pemeliharaan", "perawatan", "penggantian rutin".
 
 - ROW
   Ciri-ciri: Right of Way — pemangkasan/penebangan pohon atau vegetasi yang mendekati/mengganggu jaringan listrik, pembersihan jalur/lintasan kabel. Kata kunci: "ROW", "pemangkasan pohon", "vegetasi", "penebangan".
@@ -874,7 +907,10 @@ Baca keseluruhan konteks laporan (bukan cuma kata pertama), lalu cocokkan ke SAL
 - INSPEKSI JTM
   Ciri-ciri: mengecek/memeriksa/patroli kondisi JARINGAN TEGANGAN MENENGAH (JTM) di LUAR gardu — tiang listrik, kawat/konduktor, isolator di jaringan, andongan kawat. Kata kunci: "inspeksi JTM", "patroli jaringan", "cek tiang", "cek jaringan".
 
-Jika laporan menyebut kombinasi (misal inspeksi SEKALIGUS ganti komponen), pilih kategori berdasarkan TUJUAN UTAMA kunjungan (inspeksi rutin gardu yang berujung ganti komponen kecil tetap INSPEKSI GARDU; sedangkan penggantian terjadwal skala pemeliharaan masuk PEMELIHARAAN).
+- PERBAIKAN
+  Ciri-ciri: memperbaiki/mereparasi komponen atau peralatan yang RUSAK/bermasalah, TAPI bukan kondisi darurat/berbahaya (itu masuk EMERGENCY) dan bukan bagian dari jadwal pemeliharaan rutin (itu masuk PEMELIHARAAN). Biasanya berupa laporan perbaikan atas keluhan/temuan kerusakan spesifik. Kata kunci: "perbaikan", "memperbaiki", "diperbaiki", "reparasi", "rusak diperbaiki".
+
+Jika laporan menyebut kombinasi (misal inspeksi SEKALIGUS ganti komponen), pilih kategori berdasarkan TUJUAN UTAMA kunjungan (inspeksi rutin gardu yang berujung ganti komponen kecil tetap INSPEKSI GARDU; penggantian terjadwal skala pemeliharaan masuk PEMELIHARAAN; perbaikan atas kerusakan yang dilaporkan/ditemukan di luar jadwal rutin masuk PERBAIKAN; kondisi darurat/berbahaya masuk EMERGENCY).
 {f'PETUNJUK: hasil pencocokan kata kunci otomatis menunjukkan kategori "{kegiatan_kw}" — pakai ini kecuali konteks laporan jelas-jelas bertentangan.' if kegiatan_kw else ''}
 
 ========================================
@@ -912,7 +948,7 @@ Teks Laporan: \"\"\"{teks}\"\"\"
 
 Balas HANYA dengan JSON valid tanpa formatting markdown seperti ```json atau penjelas lainnya. Format JSON harus persis seperti ini:
 {{
-  "kegiatan": "PILIH SALAH SATU: EMERGENCY / INSPEKSI GARDU / PEMELIHARAAN / ROW / INSPEKSI JTM",
+  "kegiatan": "PILIH SALAH SATU: EMERGENCY / INSPEKSI GARDU / PEMELIHARAAN / ROW / INSPEKSI JTM / PERBAIKAN",
   "material": [
     {{
       "nama": "nama material yang disebutkan",
@@ -1006,8 +1042,9 @@ def format_lokasi(loc: Optional[dict]) -> str:
     return f"{nama} ({lat}, {lon})"
 
 
-def tulis_ke_sheet(hari: str, tanggal: str, data: dict, loc: Optional[dict] = None) -> int:
+def tulis_ke_sheet(hari: str, tanggal_waktu: str, data: dict, loc: Optional[dict] = None) -> int:
     """Cari baris pertama yang kolom Deskripsi (E) masih kosong, isi di situ.
+    Kolom C sekarang "Tanggal & Waktu" digabung (mis. "14-07-2026 16:33").
     Kembalikan nomor baris yang ditulis."""
     ws = get_sheet()
     semua = ws.get_all_values()  # termasuk header di baris 1
@@ -1028,7 +1065,7 @@ def tulis_ke_sheet(hari: str, tanggal: str, data: dict, loc: Optional[dict] = No
 
     no_val = cell(0) or str(target_row - 1)
     hari_val = cell(1) or hari
-    tanggal_val = cell(2) or tanggal
+    tanggal_val = cell(2) or tanggal_waktu
     kegiatan_val = cell(3) or data.get("kegiatan", "")
 
     material_list = data.get("material", [])
