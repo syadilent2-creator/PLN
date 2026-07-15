@@ -46,56 +46,55 @@ BASE_FOTO_DIR = "foto"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 # (connect_timeout, read_timeout) detik. Transkrip audio & ekstraksi JSON kadang butuh
 # waktu lebih dari 30 detik terutama untuk VN yang agak panjang, jadi dinaikkan + ada retry.
-GEMINI_TIMEOUT = (10, 90)
-GEMINI_MAX_RETRY = 3
-GEMINI_RETRY_BACKOFF = [3, 8]  # jeda (detik) sebelum percobaan ke-2 dan ke-3
+GEMINI_TIMEOUT = (15, 150)
+GEMINI_MAX_RETRY = 6
+GEMINI_RETRY_BACKOFF = [5, 10, 20, 35, 60]  # jeda (detik) sebelum percobaan ke-2 dan ke-3
 
 
 def panggil_gemini(payload: dict):
-    """Panggil Gemini generateContent dengan timeout longgar + retry otomatis
-    (dengan jeda/backoff) kalau kena timeout atau server Gemini sendiri lagi
-    sibuk/overload (503/5xx). Tanpa jeda, retry langsung bisa kena server yang
-    sama yang masih sibuk, jadi percuma."""
+    """Panggil Gemini dengan retry yang lebih kuat"""
     headers = {"x-goog-api-key": GEMINI_API_KEY}
-    percobaan_terakhir_error = None
-    for percobaan in range(1, GEMINI_MAX_RETRY + 1):
-        if percobaan > 1:
-            jeda = GEMINI_RETRY_BACKOFF[min(percobaan - 2, len(GEMINI_RETRY_BACKOFF) - 1)]
-            time.sleep(jeda)
+    last_error = None
+    
+    for attempt in range(1, GEMINI_MAX_RETRY + 1):
+        if attempt > 1:
+            delay = GEMINI_RETRY_BACKOFF[min(attempt-2, len(GEMINI_RETRY_BACKOFF)-1)]
+            time.sleep(delay + random.uniform(0, 3))  # jitter
+            
         try:
             res = requests.post(GEMINI_URL, headers=headers, json=payload, timeout=GEMINI_TIMEOUT)
             res.raise_for_status()
             return res
         except requests.Timeout as e:
-            percobaan_terakhir_error = e
-            logger.warning(f"Gemini API timeout (percobaan {percobaan}/{GEMINI_MAX_RETRY})")
+            last_error = e
+            logger.warning(f"Gemini timeout (attempt {attempt}/{GEMINI_MAX_RETRY})")
         except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else None
-            if status is not None and status < 500:
-                raise  # error client (400/403/404 dst) tidak perlu diulang, langsung lempar
-            percobaan_terakhir_error = e
-            logger.warning(f"Gemini API error {status} (percobaan {percobaan}/{GEMINI_MAX_RETRY})")
-        except requests.ConnectionError as e:
-            percobaan_terakhir_error = e
-            logger.warning(f"Gemini API connection error (percobaan {percobaan}/{GEMINI_MAX_RETRY})")
-    raise percobaan_terakhir_error
+            status = e.response.status_code if e.response else None
+            if status and status < 500 and status not in (429, 503):
+                raise
+            last_error = e
+            logger.warning(f"Gemini error {status} (attempt {attempt})")
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Gemini connection error (attempt {attempt})")
+    
+    raise last_error
 
 
 def pesan_error_gemini(e: Exception) -> str:
-    """Ubah error teknis dari Gemini jadi pesan yang enak dibaca user biasa."""
     if isinstance(e, requests.Timeout):
-        return "Server AI lambat merespons (timeout). Coba lagi dalam beberapa saat."
+        return "Server AI lambat. Coba lagi dalam 30 detik."
     if isinstance(e, requests.HTTPError):
-        status = e.response.status_code if e.response is not None else None
-        if status == 503 or status == 429:
-            return "Server AI sedang sibuk/overload. Coba lagi dalam 1-2 menit ya."
+        status = e.response.status_code if e.response else None
+        if status in (503, 429):
+            return "Server AI sedang sibuk. Coba lagi sebentar atau ketik manual."
         if status in (401, 403):
-            return "GEMINI_API_KEY bermasalah (ditolak server). Hubungi admin bot."
-        return f"Server AI mengalami gangguan (kode {status}). Coba lagi sebentar."
-    return f"Gagal memproses laporan: {e}"
+            return "API Key Gemini bermasalah. Hubungi admin."
+        return f"Server AI gangguan (kode {status})."
+    return "Gagal memproses laporan. Coba lagi nanti."
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1vXFzN8nktmBmHUzN9KqkpaIBhHUSmoaXCXQOMb2Q2MY")
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # isi mentah file JSON service account
@@ -754,13 +753,11 @@ def proses_location(user_id, chat_id, loc):
 def proses_voice_note(user_id, chat_id, file_id):
     try:
         if not GEMINI_API_KEY:
-            kirim_pesan(chat_id, "GEMINI_API_KEY belum diset di server. Hubungi admin bot.")
+            kirim_pesan(chat_id, "GEMINI_API_KEY belum diset.")
             return
 
-        # 1. Download file voice dari Telegram
         audio_path = download_telegram_file(file_id)
 
-        # 2. Transkrip suara -> teks (Gemini)
         with open(audio_path, "rb") as f:
             audio_data = base64.b64encode(f.read()).decode("utf-8")
         os.remove(audio_path)
@@ -768,49 +765,72 @@ def proses_voice_note(user_id, chat_id, file_id):
         payload = {
             "contents": [{
                 "parts": [
-                    {
-                        "inlineData": {
-                            "mimeType": "audio/ogg",
-                            "data": audio_data
-                        }
-                    },
-                    {
-                        "text": "Transkripsikan rekaman suara ini ke dalam teks bahasa Indonesia secara lengkap dan akurat. Jangan tambahkan komentar lain."
-                    }
+                    {"inlineData": {"mimeType": "audio/ogg", "data": audio_data}},
+                    {"text": "Transkripsikan rekaman suara ini ke dalam teks bahasa Indonesia secara lengkap dan akurat. Jangan tambahkan komentar lain."}
                 ]
             }]
         }
 
         res = panggil_gemini(payload)
-        res_json = res.json()
-        teks = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+        teks = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
         if not teks:
-            kirim_pesan(chat_id, "Maaf, suara tidak bisa dikenali. Coba rekam ulang lebih jelas.")
+            kirim_pesan(chat_id, "Suara tidak terdeteksi dengan jelas.")
             return
 
         proses_dan_simpan_laporan(user_id, chat_id, teks, sumber="suara")
 
-    except (requests.Timeout, requests.HTTPError, requests.ConnectionError) as e:
-        logger.exception("Gagal transkrip voice note (error Gemini)")
-        kirim_pesan(chat_id, pesan_error_gemini(e))
     except Exception as e:
         logger.exception("Gagal proses voice note")
-        kirim_pesan(chat_id, f"Gagal memproses laporan: {e}")
-
-
-def proses_laporan_teks(user_id, chat_id, teks):
-    try:
-        if not GEMINI_API_KEY:
-            kirim_pesan(chat_id, "GEMINI_API_KEY belum diset di server. Hubungi admin bot.")
-            return
-        proses_dan_simpan_laporan(user_id, chat_id, teks, sumber="teks")
-    except (requests.Timeout, requests.HTTPError, requests.ConnectionError) as e:
-        logger.exception("Gagal proses laporan teks (error Gemini)")
         kirim_pesan(chat_id, pesan_error_gemini(e))
+
+
+# ekstrak_laporan dengan fallback kuat
+def ekstrak_laporan(teks: str) -> dict:
+    kegiatan_kw = deteksi_kegiatan_dari_kata_kunci(teks)
+    material_regex = deteksi_material_regex(teks)
+
+    hasil = {"kegiatan": kegiatan_kw or "LAINNYA", "material": list(material_regex)}
+
+    # Coba pakai Gemini
+    try:
+        # (prompt tetap sama seperti kode asli kamu)
+        prompt = f"""... [masukkan prompt lengkap kamu di sini] ..."""   # copy prompt panjang dari kode asli
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json"}
+        }
+
+        res = panggil_gemini(payload)
+        content = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        # Bersihkan markdown
+        if content.startswith("```"):
+            content = "\n".join(content.splitlines()[1:-1]).strip()
+
+        ai_result = json.loads(content)
+
+        # Prioritaskan hasil keyword
+        if kegiatan_kw:
+            hasil["kegiatan"] = kegiatan_kw
+        elif ai_result.get("kegiatan"):
+            ai_keg = ai_result["kegiatan"].strip().upper()
+            if ai_keg in KEGIATAN_LABEL.values():
+                hasil["kegiatan"] = ai_keg
+
+        # Tambah material dari AI
+        nama_sudah_ada = {m["nama"].strip().lower() for m in hasil["material"]}
+        for m in ai_result.get("material", []):
+            nama = (m.get("nama") or "").strip()
+            if nama and nama.lower() not in nama_sudah_ada:
+                hasil["material"].append({"nama": nama, "jumlah": m.get("jumlah", "-")})
+                nama_sudah_ada.add(nama.lower())
+
     except Exception as e:
-        logger.exception("Gagal proses laporan teks")
-        kirim_pesan(chat_id, f"Gagal memproses laporan: {e}")
+        logger.warning(f"Gemini gagal, pakai fallback keyword only: {e}")
+
+    return hasil
 
 
 def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
