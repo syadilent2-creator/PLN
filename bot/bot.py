@@ -729,10 +729,27 @@ def serve_foto(filename):
     return resp
 
 
+def cari_baris_laporan_terakhir() -> Optional[int]:
+    """Fallback terakhir kalau cache in-memory (ROW_BY_MESSAGE/LAST_ROW_BY_USER) kosong
+    -- ini terjadi kalau server baru saja restart/redeploy (cache in-memory ikut hilang).
+    Cari langsung dari sheet: baris terakhir yang kolom Deskripsi-nya sudah terisi."""
+    try:
+        ws = get_sheet()
+        semua = ws.get_all_values()
+        for i in range(len(semua), 1, -1):
+            row = semua[i - 1]
+            deskripsi_cell = row[4] if len(row) > 4 else ""
+            if deskripsi_cell.strip():
+                return i
+    except Exception:
+        logger.exception("Gagal cari baris laporan terakhir sbg fallback foto")
+    return None
+
+
 def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
     """Handle foto yang dikirim user (biasanya sebagai reply ke ringkasan laporan).
     Foto disimpan di server ini sendiri lalu disisipkan ke kolom Gambar (kolom I)
-    pada baris yang sesuai, memakai formula IMAGE(url, 1) supaya ukurannya otomatis
+    pada baris yang sesuai, memakai formula IMAGE(url) supaya ukurannya otomatis
     menyesuaikan ukuran cell."""
     if not PUBLIC_BASE_URL:
         kirim_pesan(
@@ -745,11 +762,17 @@ def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
 
     local_path = None
     try:
-        # Tentukan baris tujuan: prioritas baris dari pesan yang di-reply,
-        # fallback ke laporan terakhir user ini kalau reply tidak spesifik/tidak ada.
+        # Tentukan baris tujuan, 3 lapis fallback:
+        # 1. Baris dari pesan spesifik yang di-reply (paling akurat).
+        # 2. Laporan terakhir milik user ini di cache in-memory.
+        # 3. Kalau cache kosong (server baru restart/redeploy) -> cari langsung dari
+        #    sheet: baris terakhir yang sudah terisi. Ini mencegah foto gagal "nyangkut"
+        #    tepat setelah server restart dan user harus kirim ulang.
         target_row = ROW_BY_MESSAGE.get(reply_msg_id) if reply_msg_id else None
         if target_row is None:
             target_row = LAST_ROW_BY_USER.get(user_id)
+        if target_row is None:
+            target_row = cari_baris_laporan_terakhir()
 
         if target_row is None:
             kirim_pesan(
@@ -761,31 +784,50 @@ def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
 
         kirim_pesan(chat_id, f"Menerima foto, menyimpan ke baris {target_row}...")
 
-        local_path = download_telegram_file(file_id, suffix=".jpg")
+        # Download dari Telegram + upload/tulis ke Sheet dibungkus retry ringan,
+        # supaya kalau server baru saja "bangun" dari cold start (permintaan pertama
+        # kadang lebih lambat/gagal), percobaan ke-2 otomatis dicoba tanpa user perlu
+        # kirim ulang foto secara manual.
+        percobaan_terakhir_error = None
+        for percobaan in range(1, 3):
+            try:
+                local_path = download_telegram_file(file_id, suffix=".jpg")
 
-        os.makedirs(FOTO_SHEET_DIR, exist_ok=True)
-        nama_file = f"baris{target_row}_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.jpg"
-        tujuan = os.path.join(FOTO_SHEET_DIR, nama_file)
+                os.makedirs(FOTO_SHEET_DIR, exist_ok=True)
+                nama_file = f"baris{target_row}_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.jpg"
+                tujuan = os.path.join(FOTO_SHEET_DIR, nama_file)
 
-        # Kompres/resize foto sebelum disimpan: Google Sheets IMAGE() punya batas ukuran
-        # file, dan foto asli dari kamera HP kadang cukup besar (beberapa MB). Diperkecil
-        # ke maks 1280px sisi terpanjang + kualitas JPEG 85% supaya jauh di bawah batas
-        # dan lebih cepat di-fetch oleh Sheets.
-        with Image.open(local_path) as img:
-            img = img.convert("RGB")  # jaga-jaga kalau ada channel alpha/mode aneh
-            img.thumbnail((1280, 1280))
-            img.save(tujuan, format="JPEG", quality=85, optimize=True)
-        os.remove(local_path)
-        local_path = None  # sudah diproses & dihapus, tidak perlu dihapus lagi di finally
+                # Kompres/resize foto sebelum disimpan: Google Sheets IMAGE() punya batas
+                # ukuran file, dan foto asli dari kamera HP kadang cukup besar (beberapa MB).
+                # Diperkecil ke maks 1280px sisi terpanjang + kualitas JPEG 85% supaya jauh
+                # di bawah batas dan lebih cepat di-fetch oleh Sheets.
+                with Image.open(local_path) as img:
+                    img = img.convert("RGB")  # jaga-jaga kalau ada channel alpha/mode aneh
+                    img.thumbnail((1280, 1280))
+                    img.save(tujuan, format="JPEG", quality=85, optimize=True)
+                os.remove(local_path)
+                local_path = None  # sudah diproses & dihapus, tidak perlu dihapus lagi di finally
 
-        url_gambar = f"{PUBLIC_BASE_URL}/foto/sheet_gambar/{nama_file}"
+                url_gambar = f"{PUBLIC_BASE_URL}/foto/sheet_gambar/{nama_file}"
 
-        ws = get_sheet()
-        ws.update(
-            f"I{target_row}:I{target_row}",
-            [[f'=IMAGE("{url_gambar}", 1)']],
-            value_input_option="USER_ENTERED",
-        )
+                ws = get_sheet()
+                ws.update(
+                    f"I{target_row}:I{target_row}",
+                    [[f'=IMAGE("{url_gambar}")']],
+                    value_input_option="USER_ENTERED",
+                )
+                percobaan_terakhir_error = None
+                break
+            except Exception as e:
+                percobaan_terakhir_error = e
+                logger.warning(f"Gagal proses foto (percobaan {percobaan}/2): {e}")
+                if local_path and os.path.exists(local_path):
+                    os.remove(local_path)
+                    local_path = None
+                time.sleep(2)
+
+        if percobaan_terakhir_error is not None:
+            raise percobaan_terakhir_error
 
         kirim_pesan(chat_id, f"Foto tersimpan di kolom Gambar, baris {target_row}.")
     except Exception as e:
