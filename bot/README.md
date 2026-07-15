@@ -30,8 +30,14 @@ python bot.py
 
 Untuk production, jalankan dengan gunicorn di belakang nginx/Caddy (biar dapat HTTPS otomatis):
 ```bash
-gunicorn -w 2 -b 0.0.0.0:5000 bot:app
+gunicorn -w 1 -b 0.0.0.0:5000 bot:app
 ```
+**PENTING: pakai `-w 1` (1 worker), JANGAN lebih.** Versi sebelumnya menyarankan `-w 2`, tapi ini
+menyebabkan bug: state (lokasi terakhir, baris laporan terakhir) sekarang disimpan di file
+`foto/state.json` yang di-lock supaya aman dipakai bareng banyak PROSES sekaligus -- tapi kalau
+kamu perlu lebih dari 1 worker untuk skala trafik lebih besar, pastikan seluruh worker mount ke
+`BASE_FOTO_DIR` yang SAMA (mis. lewat Railway Volume) supaya file state-nya benar-benar dibagi,
+bukan masing-masing worker punya salinan disk terpisah.
 
 ### 3. Deploy frontend (`miniapp/`)
 Upload folder `miniapp/` ke hosting statis HTTPS apapun, misalnya:
@@ -64,7 +70,7 @@ Sheet punya 9 kolom: `No, Hari, Tanggal, Kegiatan, Deskripsi, Material, Jumlah, 
 1. **Kegiatan** — teks laporan (VN atau ketik) dicocokkan otomatis oleh AI ke salah satu dari 5 kategori resmi (EMERGENCY, INSPEKSI GARDU, PEMELIHARAAN, ROW, INSPEKSI JTM) berdasarkan konteks, bukan cuma kata pertama.
 2. **Material & Jumlah** — dikenali dari kata kunci seperti "mengganti", "menggunakan", "sebanyak", "jumlah", atau pola "nama barang + angka + satuan".
 3. **Lokasi** — otomatis terisi dari lokasi terakhir yang di-share user (tombol 📍, atau dari Mini App kamera), berupa `nama daerah (lat, lon)`.
-4. **Gambar** — setelah bot membalas ringkasan laporan, **reply pesan ringkasan itu dengan foto**. Foto disimpan di server bot ini sendiri (folder `foto/sheet_gambar/`) dan di-serve lewat endpoint publik `/foto/...`, lalu disisipkan ke kolom Gambar di baris yang sama memakai formula `=IMAGE(url, 1)` — otomatis menyesuaikan ukuran cell.
+4. **Gambar** — setelah bot membalas ringkasan laporan, **reply pesan ringkasan itu dengan foto**. Foto disimpan di server bot ini sendiri (folder `foto/sheet_gambar/`) dan di-serve lewat endpoint publik `/foto/...`, lalu disisipkan ke kolom Gambar di baris yang sama memakai formula `=IMAGE(url)` — otomatis menyesuaikan ukuran cell (mode fit-to-cell adalah default kalau parameter mode tidak diisi, supaya tidak kena masalah locale titik-koma vs koma pada formula Sheets).
 5. **Tombol keyboard persisten** — setelah `/start`, muncul 2 tombol di bawah kolom chat:
    - 📍 **Bagikan Lokasi Saya** — 1 tap langsung share lokasi (tanpa buka menu attachment).
    - 🔄 **Mulai Kegiatan Baru** — reset kaitan "laporan terakhir" supaya foto berikutnya tidak salah nyangkut ke laporan lama, lalu bot siap terima laporan baru.
