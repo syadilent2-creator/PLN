@@ -126,18 +126,6 @@ app = Flask(__name__)
 
 # ======================================================================
 
-@app.route("/test-gemini", methods=["GET"])
-def test_gemini():
-    if not GEMINI_API_KEY:
-        return jsonify({"status": "error", "message": "GEMINI_API_KEY belum diisi"}), 400
-    try:
-        payload = {"contents": [{"parts": [{"text": "Halo, balas dengan kata 'OK' saja."}]}]}
-        res = panggil_gemini(payload)
-        text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return jsonify({"status": "success", "response": text})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
 # ======================================================================
 # STATE BERSAMA (lokasi terakhir, baris laporan terakhir, dsb) -- DISIMPAN DI FILE,
 # BUKAN DICT DI MEMORI.
@@ -1285,6 +1273,18 @@ def kirim_tombol_minta_lokasi(chat_id):
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "running"})
+
+@app.route("/test-gemini", methods=["GET"])
+def test_gemini():
+    if not GEMINI_API_KEY:
+        return jsonify({"status": "error", "message": "GEMINI_API_KEY belum diisi"}), 400
+    try:
+        payload = {"contents": [{"parts": [{"text": "Halo, balas dengan kata 'OK' saja."}]}]}
+        res = panggil_gemini(payload)
+        text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return jsonify({"status": "success", "response": text})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 if __name__ == "__main__":
