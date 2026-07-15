@@ -118,21 +118,100 @@ FONT_DIR = os.path.join(BASE_DIR, "fonts")
 LOGO_ICON_PATH = os.path.join(BASE_DIR, "assets", "logo_pln_icon.png")
 ULP_NAME = os.getenv("ULP_NAME", "ULP Benubenua")
 
+import fcntl  # untuk file-lock lintas proses (aman dipakai bareng beberapa worker gunicorn)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Cache lokasi terakhir per user, in-memory: { user_id: {"lat":.., "lon":.., "nama":.., "waktu": datetime} }
-LAST_LOCATION = {}
+# ======================================================================
+# STATE BERSAMA (lokasi terakhir, baris laporan terakhir, dsb) -- DISIMPAN DI FILE,
+# BUKAN DICT DI MEMORI.
+# ======================================================================
+# Kenapa? Kalau backend dijalankan dengan lebih dari 1 worker (mis. "gunicorn -w 2"),
+# setiap worker adalah PROSES TERPISAH dengan memorinya sendiri-sendiri. Dict biasa
+# ("LAST_LOCATION = {}") TIDAK dibagi antar proses, jadi kalau share-location ditangani
+# worker #1 tapi laporan suara berikutnya ditangani worker #2, worker #2 tidak akan
+# tahu soal lokasi yang baru saja disimpan -> kolom Lokasi kosong secara acak/tidak
+# konsisten. Menyimpan state ini ke file di disk (dengan file-lock) membuat semua
+# worker baca-tulis dari sumber yang sama, dan sebagai bonus juga tetap ada walau
+# satu worker/proses di-restart.
+STATE_FILE = os.path.join(BASE_FOTO_DIR, "state.json")
+_STATE_KOSONG = {"lokasi": {}, "baris_terakhir": {}, "baris_by_pesan": {}}
 
-# Cache untuk fitur "reply dengan foto -> masuk kolom Gambar":
-# - ROW_BY_MESSAGE: { message_id balasan ringkasan bot : nomor baris di sheet }
-#   Dipakai kalau user reply LANGSUNG ke pesan ringkasan laporan tsb dengan foto.
-# - LAST_ROW_BY_USER: { user_id : nomor baris terakhir yang ditulis }
-#   Fallback kalau user kirim foto tanpa reply spesifik (dianggap untuk laporan terakhirnya).
-ROW_BY_MESSAGE = {}
-LAST_ROW_BY_USER = {}
+
+def _baca_tulis_state(mutator=None):
+    """Baca file state, jalankan mutator(state) untuk memodifikasi (opsional), lalu
+    tulis balik kalau ada mutator. Pakai file-lock exclusive supaya aman dipakai
+    beberapa worker/proses sekaligus tanpa saling menimpa."""
+    os.makedirs(BASE_FOTO_DIR, exist_ok=True)
+    with open(STATE_FILE, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            raw = f.read()
+            try:
+                state = json.loads(raw) if raw.strip() else dict(_STATE_KOSONG)
+            except json.JSONDecodeError:
+                state = dict(_STATE_KOSONG)
+            for k, v in _STATE_KOSONG.items():
+                state.setdefault(k, dict(v))
+
+            if mutator is not None:
+                mutator(state)
+                f.seek(0)
+                f.truncate()
+                json.dump(state, f)
+                f.flush()
+                os.fsync(f.fileno())
+            return state
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def simpan_lokasi(user_id, lat, lon, nama):
+    def _mut(state):
+        state["lokasi"][str(user_id)] = {
+            "lat": lat, "lon": lon, "nama": nama,
+            "waktu": datetime.now(TZ).isoformat(),
+        }
+    _baca_tulis_state(_mut)
+
+
+def ambil_lokasi(user_id) -> Optional[dict]:
+    state = _baca_tulis_state()
+    return state["lokasi"].get(str(user_id))
+
+
+def simpan_baris_terakhir(user_id, baris: int):
+    def _mut(state):
+        state["baris_terakhir"][str(user_id)] = baris
+    _baca_tulis_state(_mut)
+
+
+def ambil_baris_terakhir(user_id) -> Optional[int]:
+    state = _baca_tulis_state()
+    return state["baris_terakhir"].get(str(user_id))
+
+
+def hapus_baris_terakhir(user_id):
+    def _mut(state):
+        state["baris_terakhir"].pop(str(user_id), None)
+    _baca_tulis_state(_mut)
+
+
+def simpan_baris_by_pesan(message_id, baris: int):
+    def _mut(state):
+        state["baris_by_pesan"][str(message_id)] = baris
+    _baca_tulis_state(_mut)
+
+
+def ambil_baris_by_pesan(message_id) -> Optional[int]:
+    if message_id is None:
+        return None
+    state = _baca_tulis_state()
+    return state["baris_by_pesan"].get(str(message_id))
 
 KEGIATAN_LABEL = {
     "emergency": "EMERGENCY",
@@ -341,17 +420,11 @@ def upload():
         alamat = ", ".join(filter(None, [jalan, kelurahan]))
         wilayah = ", ".join(filter(None, [f"Kec. {kecamatan}" if kecamatan else "", kota]))
         
-        # Simpan lokasi terbaru ke LAST_LOCATION agar dipakai untuk VN/teks Telegram berikutnya
+        # Simpan lokasi terbaru (state di file, dibagi semua worker) agar dipakai
+        # untuk VN/teks Telegram berikutnya
         nama_lokasi = ", ".join(filter(None, [alamat, wilayah])) or "Lokasi tidak diketahui"
         try:
-            u_id = int(user_id) if str(user_id).isdigit() else user_id
-            LAST_LOCATION[u_id] = {
-                "lat": lat,
-                "lon": lon,
-                "nama": nama_lokasi,
-                "waktu": now
-            }
-            LAST_LOCATION[str(user_id)] = LAST_LOCATION[u_id]
+            simpan_lokasi(user_id, lat, lon, nama_lokasi)
             logger.info(f"Lokasi user {user_id} disimpan dari Mini App: {nama_lokasi}")
         except Exception:
             logger.exception("Gagal menyimpan lokasi dari Mini App")
@@ -522,7 +595,7 @@ def telegram_webhook():
 
         # Tombol "Mulai Kegiatan Baru" (dikirim sebagai teks biasa oleh keyboard Telegram)
         if teks == TOMBOL_MULAI_ULANG:
-            LAST_ROW_BY_USER.pop(user_id, None)
+            hapus_baris_terakhir(user_id)
             kirim_pesan(
                 chat_id,
                 "Oke, siap menerima laporan kegiatan baru \u2705\n\n"
@@ -555,10 +628,7 @@ def telegram_webhook():
                         "Contoh: `/lokasi Gardu Induk Rungkut, Surabaya`",
                     )
                 else:
-                    LAST_LOCATION[user_id] = {
-                        "lat": None, "lon": None, "nama": nama_lokasi,
-                        "waktu": datetime.now(TZ),
-                    }
+                    simpan_lokasi(user_id, None, None, nama_lokasi)
                     kirim_pesan(
                         chat_id,
                         f"Lokasi tersimpan (manual): {nama_lokasi}\n"
@@ -595,7 +665,7 @@ def proses_location(user_id, chat_id, loc):
     except Exception:
         logger.exception("Gagal reverse geocode lokasi")
 
-    LAST_LOCATION[user_id] = {"lat": lat, "lon": lon, "nama": nama, "waktu": datetime.now(TZ)}
+    simpan_lokasi(user_id, lat, lon, nama)
     kirim_pesan(
         chat_id,
         f"Lokasi tersimpan: {nama}\nAkan dipakai otomatis untuk laporan-laporan berikutnya.",
@@ -676,8 +746,7 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
 
     # 2. Ambil lokasi terakhir user (dari share-location / Mini App) SEBELUM tulis ke sheet,
     #    supaya kolom Lokasi langsung terisi nama daerah + titik koordinat.
-    u_id = int(user_id) if str(user_id).isdigit() else user_id
-    loc = LAST_LOCATION.get(u_id) or LAST_LOCATION.get(str(u_id))
+    loc = ambil_lokasi(user_id)
     lokasi_teks = loc["nama"] if loc else "(belum ada lokasi)"
 
     # 3. Tulis ke Google Sheet
@@ -690,7 +759,7 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
 
     # Simpan baris ini sebagai "laporan terakhir" user, dipakai kalau nanti user
     # reply pesan ringkasan di bawah ini dengan foto -> foto masuk ke baris yang sama.
-    LAST_ROW_BY_USER[user_id] = baris
+    simpan_baris_terakhir(user_id, baris)
 
     # 4. Balas ringkasan ke user
     material_teks = "\n".join(
@@ -715,7 +784,7 @@ def proses_dan_simpan_laporan(user_id, chat_id, teks: str, sumber: str):
     # foto, kita tahu persis baris mana yang harus diisi kolom Gambar-nya.
     try:
         sent_message_id = hasil_kirim.json()["result"]["message_id"]
-        ROW_BY_MESSAGE[sent_message_id] = baris
+        simpan_baris_by_pesan(sent_message_id, baris)
     except Exception:
         logger.exception("Gagal mencatat message_id -> baris untuk fitur reply foto")
 
@@ -763,8 +832,8 @@ def serve_foto(filename):
 
 
 def cari_baris_laporan_terakhir() -> Optional[int]:
-    """Fallback terakhir kalau cache in-memory (ROW_BY_MESSAGE/LAST_ROW_BY_USER) kosong
-    -- ini terjadi kalau server baru saja restart/redeploy (cache in-memory ikut hilang).
+    """Fallback terakhir kalau state di file (baris_by_pesan/baris_terakhir) kosong
+    -- misal user kirim foto tanpa laporan sebelumnya sama sekali.
     Cari langsung dari sheet: baris terakhir yang kolom Deskripsi-nya sudah terisi."""
     try:
         ws = get_sheet()
@@ -797,13 +866,12 @@ def proses_foto_laporan(user_id, chat_id, file_id, reply_msg_id):
     try:
         # Tentukan baris tujuan, 3 lapis fallback:
         # 1. Baris dari pesan spesifik yang di-reply (paling akurat).
-        # 2. Laporan terakhir milik user ini di cache in-memory.
-        # 3. Kalau cache kosong (server baru restart/redeploy) -> cari langsung dari
-        #    sheet: baris terakhir yang sudah terisi. Ini mencegah foto gagal "nyangkut"
-        #    tepat setelah server restart dan user harus kirim ulang.
-        target_row = ROW_BY_MESSAGE.get(reply_msg_id) if reply_msg_id else None
+        # 2. Laporan terakhir milik user ini (state di file, dibagi semua worker).
+        # 3. Kalau state kosong (belum pernah ada laporan sama sekali) -> cari langsung
+        #    dari sheet: baris terakhir yang sudah terisi.
+        target_row = ambil_baris_by_pesan(reply_msg_id)
         if target_row is None:
-            target_row = LAST_ROW_BY_USER.get(user_id)
+            target_row = ambil_baris_terakhir(user_id)
         if target_row is None:
             target_row = cari_baris_laporan_terakhir()
 
