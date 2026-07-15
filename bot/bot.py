@@ -46,7 +46,7 @@ BASE_FOTO_DIR = "foto"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
 # (connect_timeout, read_timeout) detik. Transkrip audio & ekstraksi JSON kadang butuh
 # waktu lebih dari 30 detik terutama untuk VN yang agak panjang, jadi dinaikkan + ada retry.
 GEMINI_TIMEOUT = (15, 150)
